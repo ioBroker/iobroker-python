@@ -15,7 +15,7 @@ from .connection import (
 from .types import Message, State, now_ms
 
 #: Single source of the version number -- pyproject.toml reads it from here.
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "Adapter",

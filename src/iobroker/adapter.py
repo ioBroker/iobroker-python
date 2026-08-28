@@ -285,6 +285,18 @@ class Adapter:
             self._stopping.set()
 
     async def _dispatch(self, channel: str, data: str) -> None:
+        # Normalise the channel before deciding what it is. The two servers disagree about the
+        # "io." prefix, and in opposite directions:
+        #
+        #   built-in server   states -> "pyexample.0.temp"     messagebox -> "io.messagebox.…"
+        #   real Redis        states -> "io.pyexample.0.temp"  messagebox -> "messagebox.…"
+        #
+        # Stripping a leading "io." first and only then looking at the prefix covers both. Checking
+        # for "messagebox." on the raw channel silently misses every message on the built-in server
+        # and routes it into the state branch instead.
+        if channel.startswith(STATES_PREFIX):
+            channel = channel[len(STATES_PREFIX) :]
+
         # Messagebox
         if channel.startswith(MESSAGE_PREFIX):
             payload = json.loads(data)
@@ -299,9 +311,8 @@ class Adapter:
             )
             return
 
-        # The built-in server delivers the channel without the "io." prefix,
-        # real Redis delivers it with. The JS client tolerates both -- so do we.
-        state_id = channel[len(STATES_PREFIX):] if channel.startswith(STATES_PREFIX) else channel
+        # Whatever is left is a state id: the prefix was already removed above.
+        state_id = channel
 
         # Controller stop signal: sigKill == -1 means "terminate yourself".
         if state_id == f"{self.instance_id}.sigKill":
