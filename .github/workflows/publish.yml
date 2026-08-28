@@ -20,6 +20,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # Die Version steht nur noch in src/iobroker/__init__.py, pyproject.toml
+      # liest sie dort aus -- die beiden koennen also nicht auseinanderlaufen.
+      # Was bleibt, ist die Luecke zwischen Release-Tag und Paketversion: man
+      # taggt v0.1.2 und hat das Bumpen vergessen. Genau das faengt dieser
+      # Schritt ab, bevor PyPI eine falsch benannte Version annimmt.
+      - name: Release-Tag gegen Paketversion pruefen
+        if: github.event_name == 'release'
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION=$(python -c "import re,pathlib; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', pathlib.Path('src/iobroker/__init__.py').read_text()).group(1))")
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' passt nicht zu __version__ '$VERSION'. Version bumpen oder Tag korrigieren."
+            exit 1
+          fi
+          echo "Tag $GITHUB_REF_NAME stimmt mit Version $VERSION ueberein."
+
       - run: pip install build twine
       - run: python -m build
       - run: python -m twine check dist/*

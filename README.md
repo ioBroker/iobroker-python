@@ -4,7 +4,7 @@ Python-SDK für ioBroker-Adapter. Spricht direkt das Redis-Wire-Protokoll der
 States- und Objects-Datenbank — ein Python-Prozess wird damit zum gleichrangigen
 Adapter neben jedem Node-Adapter, ohne Brücke und ohne Umweg.
 
-> **Status: 0.1.0, früher Entwurf.** Die Wire-Ebene ist gegen eine laufende
+> **Status: früher Entwurf.** Die Wire-Ebene ist gegen eine laufende
 > Installation verifiziert (js-controller 7.2.3, `jsonl`-Datenbanken). Die API
 > kann sich noch ändern.
 
