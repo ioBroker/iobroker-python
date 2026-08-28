@@ -12,10 +12,11 @@ from .connection import (
     connect_async,
     load_db_config,
 )
+from .crypto import decrypt
 from .types import Message, State, now_ms
 
 #: Single source of the version number -- pyproject.toml reads it from here.
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 
 __all__ = [
     "Adapter",
@@ -27,5 +28,6 @@ __all__ = [
     "connect_async",
     "load_db_config",
     "now_ms",
+    "decrypt",
     "__version__",
 ]

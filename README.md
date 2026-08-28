@@ -95,6 +95,31 @@ Reports what both databases support in your installation, then performs a full
 round trip: create an object, write a state, receive the change. Cleans up again
 with `--cleanup`.
 
+## Encrypted settings
+
+ioBroker stores password fields in an instance's `native` section encrypted with the system secret.
+Everything an adapter lists in `common.encryptedNative` arrives already decrypted in `self.config`,
+so a password is read the same way as a hostname:
+
+```python
+async def on_ready(self):
+    session = login(self.config["host"], self.config["password"])
+```
+
+Both storage formats are supported — AES-192-CBC as produced by current installations, and the
+older XOR form still found in installations set up years ago. Which one applies is decided exactly
+the way js-controller decides it.
+
+AES needs the `cryptography` package, which is an optional dependency:
+
+```toml
+dependencies = ["iobroker[crypto]>=0.2.0"]
+```
+
+It is optional because it is compiled, and on a Raspberry Pi that is the difference between a fast
+install and a long build — an adapter without encrypted settings should not pay for it. If a value
+turns out to need it and it is missing, the error says so.
+
 ## Lifecycle
 
 `alive`, `connected`, `uptime` and `memRss` are written by the adapter itself

@@ -21,7 +21,11 @@ classifiers = [
 dependencies = ["redis>=5.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "cryptography>=42"]
+# Only needed by adapters whose settings contain encrypted fields. Kept optional
+# because it is a compiled package, which on a Raspberry Pi is the difference between
+# a fast install and a long build.
+crypto = ["cryptography>=42"]
 metrics = ["psutil>=5.9"]
 
 [project.urls]
@@ -35,6 +39,10 @@ path = "src/iobroker/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/iobroker"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100

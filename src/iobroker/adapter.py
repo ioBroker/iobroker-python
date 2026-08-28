@@ -40,6 +40,7 @@ from .connection import (
     connect_async,
     load_db_config,
 )
+from .crypto import decrypt, decrypt_native
 from .types import Message, State, now_ms
 
 __all__ = ["Adapter"]
@@ -69,6 +70,7 @@ class Adapter:
         self._loglevel = os.environ.get("IOB_LOGLEVEL") or _read_loglevel()
 
         self._builtin_states = True
+        self._secret: str | None = None
 
     # -- Lifecycle hooks, meant to be overridden --------------------------
 
@@ -127,13 +129,56 @@ class Adapter:
             await self._shutdown()
 
     async def _load_config(self) -> None:
-        """Read ``native`` from the instance object into ``self.config``."""
+        """Read ``native`` from the instance object into ``self.config``.
+
+        Entries listed in ``common.encryptedNative`` arrive decrypted, so an adapter reads a
+        password the same way it reads a hostname. Doing it here rather than leaving it to every
+        adapter is what keeps credentials from being used in their encrypted form by accident.
+        """
         obj = await self.get_foreign_object(self.instance_id)
-        if obj:
-            self.config = obj.get("native") or {}
-            common = obj.get("common") or {}
-            if common.get("loglevel"):
-                self._loglevel = common["loglevel"]
+
+        if not obj:
+            return
+
+        self.config = obj.get("native") or {}
+        common = obj.get("common") or {}
+
+        if common.get("loglevel"):
+            self._loglevel = common["loglevel"]
+
+        encrypted = common.get("encryptedNative")
+
+        if encrypted:
+            secret = await self.get_system_secret()
+            try:
+                self.config = decrypt_native(secret, self.config, encrypted)
+            except Exception as exc:  # noqa: BLE001
+                # Carrying on with encrypted values would fail later at the device, far from the
+                # cause, so say it here.
+                self.log.error(f"Cannot decrypt the configuration: {exc}")
+
+    async def get_system_secret(self) -> str:
+        """Read the system secret used to encrypt configuration values."""
+        if self._secret is None:
+            obj = await self.get_foreign_object("system.config")
+            self._secret = ((obj or {}).get("native") or {}).get("secret") or ""
+
+        return self._secret
+
+    async def get_encrypted_config(self, key: str) -> str | None:
+        """Read a single encrypted value from the configuration.
+
+        Only needed for values not listed in ``common.encryptedNative``; everything listed there is
+        already decrypted in ``self.config``.
+
+        :param key: name of the entry in ``native``
+        """
+        value = self.config.get(key)
+
+        if not isinstance(value, str) or not value:
+            return None
+
+        return decrypt(await self.get_system_secret(), value)
 
     # -- States -----------------------------------------------------------
 
