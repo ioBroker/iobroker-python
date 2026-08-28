@@ -16,8 +16,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -40,20 +40,25 @@ jobs:
       - run: pip install build twine
       - run: python -m build
       - run: python -m twine check dist/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
 
   publish:
     needs: build
+    # Nur echte Releases veroeffentlichen. Damit ist ein manueller Start
+    # ueber "Run workflow" ein gefahrloser Trockenlauf: er baut und prueft,
+    # ruehrt PyPI aber nicht an -- und PyPI nimmt eine Version ohnehin nie
+    # ein zweites Mal an.
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       # Der Token, mit dem sich der Workflow bei PyPI ausweist.
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
