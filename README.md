@@ -44,7 +44,7 @@ class MyAdapter(Adapter):
 MyAdapter("myadapter").run()
 ```
 
-Ein lauffähiges Beispiel steht in [`examples/minimal_adapter.py`](examples/minimal_adapter.py).
+Ein lauffähiges Beispiel steht in [`examples/minimal_adapter.py`](https://github.com/ioBroker/iobroker-python/blob/main/examples/minimal_adapter.py).
 
 ## Verbindungsdaten
 
@@ -86,6 +86,8 @@ genauso — nur kommt bei Python fremder Code aus PyPI mit in den Prozess.
 ```bash
 python tools/probe.py
 ```
+
+(aus dem [Repository](https://github.com/ioBroker/iobroker-python), nicht im Wheel enthalten)
 
 Meldet für die eigene Installation, was die beiden Datenbanken können, und macht
 anschließend einen vollständigen Round-Trip: Objekt anlegen, State schreiben,
