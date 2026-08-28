@@ -1,11 +1,10 @@
 name: Publish to PyPI
 
-# Veroeffentlicht bei jedem GitHub-Release. Kein API-Token noetig:
-# PyPI vertraut diesem Workflow ueber OIDC (Trusted Publishing).
-# Voraussetzung: auf pypi.org unter Account -> Publishing ein
-# "pending publisher" mit genau diesen Werten anlegen --
-#   Project: iobroker | Owner: ioBroker
-#   Repository: iobroker-python | Workflow: publish.yml | Environment: pypi
+# Publishes on every GitHub release. No API token needed: PyPI trusts this
+# workflow through OIDC (Trusted Publishing). The matching Trusted Publisher
+# is configured on pypi.org under the project's publishing settings --
+#   Owner: ioBroker | Repository: iobroker-python
+#   Workflow: publish.yml | Environment: pypi
 
 on:
   release:
@@ -21,21 +20,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Die Version steht nur noch in src/iobroker/__init__.py, pyproject.toml
-      # liest sie dort aus -- die beiden koennen also nicht auseinanderlaufen.
-      # Was bleibt, ist die Luecke zwischen Release-Tag und Paketversion: man
-      # taggt v0.1.2 und hat das Bumpen vergessen. Genau das faengt dieser
-      # Schritt ab, bevor PyPI eine falsch benannte Version annimmt.
-      - name: Release-Tag gegen Paketversion pruefen
+      # The version lives in src/iobroker/__init__.py only and pyproject.toml
+      # reads it from there, so those two cannot drift apart. What remains is
+      # the gap between release tag and package version: tagging v0.1.2 while
+      # forgetting to bump. This step catches exactly that, before PyPI accepts
+      # a misnamed version.
+      - name: Check release tag against package version
         if: github.event_name == 'release'
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           VERSION=$(python -c "import re,pathlib; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', pathlib.Path('src/iobroker/__init__.py').read_text()).group(1))")
           if [ "$TAG" != "$VERSION" ]; then
-            echo "::error::Tag '$GITHUB_REF_NAME' passt nicht zu __version__ '$VERSION'. Version bumpen oder Tag korrigieren."
+            echo "::error::Tag '$GITHUB_REF_NAME' does not match __version__ '$VERSION'. Bump the version or fix the tag."
             exit 1
           fi
-          echo "Tag $GITHUB_REF_NAME stimmt mit Version $VERSION ueberein."
+          echo "Tag $GITHUB_REF_NAME matches version $VERSION."
 
       - run: pip install build twine
       - run: python -m build
@@ -47,15 +46,14 @@ jobs:
 
   publish:
     needs: build
-    # Nur echte Releases veroeffentlichen. Damit ist ein manueller Start
-    # ueber "Run workflow" ein gefahrloser Trockenlauf: er baut und prueft,
-    # ruehrt PyPI aber nicht an -- und PyPI nimmt eine Version ohnehin nie
-    # ein zweites Mal an.
+    # Publish real releases only. This turns a manual "Run workflow" start
+    # into a harmless dry run: it builds and checks but never touches PyPI --
+    # which would reject an already published version anyway.
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      # Der Token, mit dem sich der Workflow bei PyPI ausweist.
+      # The token the workflow uses to identify itself to PyPI.
       id-token: write
     steps:
       - uses: actions/download-artifact@v8

@@ -1,13 +1,12 @@
-"""Kleinster vollstaendiger Python-Adapter.
+"""Smallest complete Python adapter.
 
-Legt zwei Objekte an, schreibt alle drei Sekunden einen Messwert und nimmt
-Schaltbefehle entgegen. Zeigt damit alle Bausteine, die ein echter Adapter
-braucht: Objekte, States, ack-Semantik, Messagebox, Logging, Shutdown.
+Creates two objects, writes a reading every three seconds and accepts switch
+commands. That covers every building block a real adapter needs: objects,
+states, ack semantics, messagebox, logging, shutdown.
 
     python examples/minimal_adapter.py --instance 0
 
-Danach im Admin unter "pyexample.0" nachsehen.
-Aufraeumen: python examples/minimal_adapter.py --cleanup
+Then look under "pyexample.0" in the admin UI.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ class ExampleAdapter(Adapter):
             {
                 "type": "state",
                 "common": {
-                    "name": "Temperatur",
+                    "name": "Temperature",
                     "type": "number",
                     "role": "value.temperature",
                     "unit": "°C",
@@ -43,7 +42,7 @@ class ExampleAdapter(Adapter):
             {
                 "type": "state",
                 "common": {
-                    "name": "Schalter",
+                    "name": "Switch",
                     "type": "boolean",
                     "role": "switch",
                     "read": True,
@@ -56,7 +55,7 @@ class ExampleAdapter(Adapter):
             {
                 "type": "state",
                 "common": {
-                    "name": "Verbunden",
+                    "name": "Connected",
                     "type": "boolean",
                     "role": "indicator.connected",
                     "read": True,
@@ -65,18 +64,18 @@ class ExampleAdapter(Adapter):
             },
         )
 
-        # Nur die eigenen States abonnieren -- alles andere waere Laerm.
+        # Subscribe to our own states only -- anything else would be noise.
         await self.subscribe_states("*")
         await self.set_state("info.connection", True, ack=True)
 
         self._worker = asyncio.create_task(self._measure())
 
     async def _measure(self) -> None:
-        """Simuliert eine Messquelle."""
+        """Stands in for a real measurement source."""
         try:
             while True:
                 value = round(20 + 2 * math.sin(time.time() / 10), 2)
-                # ack=True: bestaetigter Messwert, kein Befehl.
+                # ack=True: a confirmed reading, not a command.
                 await self.set_state("temperature", value, ack=True)
                 await asyncio.sleep(3)
         except asyncio.CancelledError:
@@ -84,16 +83,16 @@ class ExampleAdapter(Adapter):
 
     async def on_state_change(self, id: str, state: State | None) -> None:
         if state is None:
-            self.log.debug(f"{id} geloescht oder abgelaufen")
+            self.log.debug(f"{id} deleted or expired")
             return
-        # ack=False heisst: jemand will etwas schalten.
+        # ack=False means somebody wants something switched.
         if not state.ack and id.endswith(".switch"):
-            self.log.info(f"Schaltbefehl: {state.val}")
-            # Geraet schalten ... und danach bestaetigen.
+            self.log.info(f"Switch command: {state.val}")
+            # Drive the device here ... and confirm afterwards.
             await self.set_state("switch", state.val, ack=True)
 
     async def on_message(self, msg: Message) -> None:
-        self.log.info(f"Nachricht '{msg.command}' von {msg.from_}")
+        self.log.info(f"Message '{msg.command}' from {msg.from_}")
         if msg.command == "ping":
             await self.reply(msg, {"pong": True})
 
@@ -101,7 +100,7 @@ class ExampleAdapter(Adapter):
         worker = getattr(self, "_worker", None)
         if worker:
             worker.cancel()
-        self.log.info("Aufgeraeumt")
+        self.log.info("Cleaned up")
 
 
 if __name__ == "__main__":

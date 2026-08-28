@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "iobroker"
 dynamic = ["version"]
-description = "Python-SDK fuer ioBroker-Adapter -- spricht direkt das Redis-Wire-Protokoll der States- und Objects-Datenbank"
+description = "Python SDK for ioBroker adapters -- speaks the Redis wire protocol of the states and objects databases directly"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -28,8 +28,8 @@ metrics = ["psutil>=5.9"]
 Homepage = "https://github.com/ioBroker/iobroker-python"
 Issues = "https://github.com/ioBroker/iobroker-python/issues"
 
-# Die Version steht ausschliesslich in src/iobroker/__init__.py.
-# Damit kann sie gar nicht erst auseinanderlaufen.
+# The version lives in src/iobroker/__init__.py only, so the two can never
+# drift apart in the first place.
 [tool.hatch.version]
 path = "src/iobroker/__init__.py"
 

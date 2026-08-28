@@ -1,30 +1,29 @@
-"""Redis-Wire-Anbindung an die ioBroker-Datenbanken.
+"""Redis wire connection to the ioBroker databases.
 
-Dieses Modul kapselt alles, was der eingebaute Redis-Server von js-controller
-anders macht als echtes Redis. Jede Abweichung hier ist am laufenden System
-nachgewiesen, nicht vermutet -- siehe ``tools/probe.py``.
+This module encapsulates everything the Redis server built into js-controller
+does differently from real Redis. Every deviation documented here was measured
+against a running installation, not assumed -- see ``tools/probe.py``.
 
-Die vier Fallstricke:
+The four pitfalls:
 
-1. **Kommandos muessen kleingeschrieben sein.** Der Server dispatcht in
-   ``db-base/redisHandler.js`` ohne ``toLowerCase()``, registriert seine Handler
-   aber ausschliesslich klein. ioredis sendet zufaellig klein, redis-py sendet
-   gross. Am Draht nachgewiesen::
+1. **Commands must be lowercase.** The server dispatches in
+   ``db-base/redisHandler.js`` without ``toLowerCase()``, yet registers its
+   handlers in lowercase only. ioredis happens to send lowercase, redis-py
+   sends uppercase. Measured on the wire::
 
        GET meta.states.protocolVersion  ->  -Error GET NOT SUPPORTED
        get meta.states.protocolVersion  ->  $1  4
 
-2. **Kein HELLO, kein CLIENT SETINFO.** redis-py verhandelt beim Verbinden
-   RESP3 und meldet den Client-Namen. Beides kennt der Server nicht, der
-   Verbindungsaufbau scheitert mit ``HELLO NOT SUPPORTED``.
+2. **No HELLO, no CLIENT SETINFO.** redis-py negotiates RESP3 on connect and
+   reports its client name. The server knows neither, so the connection fails
+   with ``HELLO NOT SUPPORTED``.
 
-3. **Kein PING auf der States-DB.** Der Verbindungstest laeuft ueber
-   ``get meta.states.protocolVersion`` -- der Schluessel muss ohnehin geprueft
-   werden.
+3. **No PING on the states database.** The connection test goes through
+   ``get meta.states.protocolVersion`` -- that key has to be checked anyway.
 
-4. **Kein SCAN auf der States-DB.** Nur die Objects-DB kann ``scan``/``sscan``.
-   Fuer States bleibt ``keys`` -- gegen echtes Redis blockierend, gegen den
-   eingebauten Server unkritisch.
+4. **No SCAN on the states database.** Only the objects database supports
+   ``scan``/``sscan``. States are left with ``keys``, which blocks against real
+   Redis but is harmless against the built-in server.
 """
 
 from __future__ import annotations
@@ -57,7 +56,7 @@ __all__ = [
     "check_protocol",
 ]
 
-#: Von diesem SDK unterstuetzte Protokollversion beider Datenbanken.
+#: Protocol version of both databases supported by this SDK.
 PROTOCOL_VERSION = "4"
 
 STATES_PREFIX = "io."
@@ -71,7 +70,6 @@ META_PREFIX = "meta."
 _CONFIG_CANDIDATES = (
     "/opt/iobroker/iobroker-data/iobroker.json",
     "C:/ioBroker/iobroker-data/iobroker.json",
-    "C:/pWork/iobroker-data/iobroker.json",
     "./iobroker-data/iobroker.json",
     "../iobroker-data/iobroker.json",
     "../../iobroker-data/iobroker.json",
@@ -79,15 +77,15 @@ _CONFIG_CANDIDATES = (
 
 
 # --------------------------------------------------------------------------
-# Kommandonamen kleinschreiben
+# Lowercasing command names
 # --------------------------------------------------------------------------
 
 def _lower_cmd(args: tuple) -> tuple:
-    """Setzt den Kommandonamen -- args[0] -- auf Kleinschreibung.
+    """Lowercase the command name -- args[0].
 
-    Mehrwortige Kommandos wie ``"CONFIG SET"`` gibt redis-py als einen String
-    weiter und zerlegt sie erst beim Packen. Kleinschreibung vor dem Zerlegen
-    trifft daher beide Formen.
+    redis-py passes multi-word commands such as ``"CONFIG SET"`` as a single
+    string and splits them only while packing. Lowercasing before the split
+    therefore covers both forms.
     """
     if args and isinstance(args[0], (str, bytes)):
         head = args[0].decode() if isinstance(args[0], bytes) else args[0]
@@ -96,7 +94,7 @@ def _lower_cmd(args: tuple) -> tuple:
 
 
 class _LowercasePacker:
-    """Haengt sich vor den Command-Packer der synchronen redis-py-Verbindung."""
+    """Wraps the command packer of the synchronous redis-py connection."""
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
@@ -112,10 +110,10 @@ class _LowercasePacker:
 
 
 class IoBrokerConnection(redis.connection.Connection):
-    """Synchrone Verbindung.
+    """Synchronous connection.
 
-    redis-py packt hier ueber ``self._command_packer``; ``pack_command`` allein
-    zu ueberschreiben greift nicht, weil ``send_command`` daran vorbeigeht.
+    Here redis-py packs through ``self._command_packer``; overriding
+    ``pack_command`` alone has no effect because ``send_command`` bypasses it.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -124,10 +122,10 @@ class IoBrokerConnection(redis.connection.Connection):
 
 
 class AsyncIoBrokerConnection(aioredis.connection.Connection):
-    """Asynchrone Verbindung.
+    """Asynchronous connection.
 
-    Hier ist es umgekehrt: ``send_command`` ruft ``self.pack_command`` direkt
-    auf, also ist genau das der richtige Haken.
+    The other way round here: ``send_command`` calls ``self.pack_command``
+    directly, so that is the correct hook.
     """
 
     def pack_command(self, *args: Any):
@@ -138,33 +136,32 @@ class AsyncIoBrokerConnection(aioredis.connection.Connection):
 
 
 # --------------------------------------------------------------------------
-# Konfiguration
+# Configuration
 # --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class DbConfig:
-    """Verbindungsdaten einer der beiden Datenbanken."""
+    """Connection settings for one of the two databases."""
 
     host: str
     port: int
     db: int
     password: str | None
-    kind: str  # "jsonl", "file" oder "redis"
+    kind: str  # "jsonl", "file" or "redis"
 
     @property
     def is_builtin(self) -> bool:
-        """True, wenn der eingebaute Server antwortet statt echtem Redis.
+        """True when the built-in server answers instead of real Redis.
 
-        Steuert, ob ``scan`` benutzt werden darf und wie Ablauf-Ereignisse
-        ankommen.
+        Determines whether ``scan`` may be used and how expiry events arrive.
         """
         return self.kind != "redis"
 
 
 def find_config(explicit: str | None = None) -> str:
-    """Sucht die ``iobroker.json``.
+    """Locate ``iobroker.json``.
 
-    Reihenfolge: Argument, Umgebungsvariable ``IOB_CONFIG``, uebliche Pfade.
+    Order: argument, ``IOB_CONFIG`` environment variable, common paths.
     """
     if explicit:
         if not os.path.isfile(explicit):
@@ -177,18 +174,18 @@ def find_config(explicit: str | None = None) -> str:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "iobroker.json nicht gefunden -- Pfad per Argument oder IOB_CONFIG angeben."
+        "iobroker.json not found -- pass a path as argument or set IOB_CONFIG."
     )
 
 
 def load_db_config(section: str, path: str | None = None) -> DbConfig:
-    """Liest den ``states``- oder ``objects``-Abschnitt der ``iobroker.json``.
+    """Read the ``states`` or ``objects`` section of ``iobroker.json``.
 
-    Der py-controller reicht diese Werte spaeter ueber Umgebungsvariablen
-    durch; dann wird die Datei gar nicht erst gelesen.
+    The py-controller will later pass these values through environment
+    variables; the file is then not read at all.
     """
     if section not in ("states", "objects"):
-        raise ValueError(f"Unbekannter Abschnitt: {section}")
+        raise ValueError(f"Unknown section: {section}")
 
     prefix = f"IOB_{section.upper()}_"
     if os.environ.get(prefix + "PORT"):
@@ -214,23 +211,23 @@ def load_db_config(section: str, path: str | None = None) -> DbConfig:
 
 
 # --------------------------------------------------------------------------
-# Verbinden
+# Connecting
 # --------------------------------------------------------------------------
 
 _POOL_KWARGS = dict(
     decode_responses=True,
     socket_timeout=10,
     socket_connect_timeout=10,
-    # RESP2 erzwingen: der eingebaute Server kennt kein HELLO.
+    # Force RESP2: the built-in server does not know HELLO.
     protocol=2,
-    # Unterdrueckt CLIENT SETINFO, das der Server ebenfalls nicht kennt.
+    # Suppresses CLIENT SETINFO, which the server does not know either.
     lib_name=None,
     lib_version=None,
 )
 
 
 def connect(cfg: DbConfig) -> redis.Redis:
-    """Baut eine synchrone Verbindung."""
+    """Open a synchronous connection."""
     pool = redis.ConnectionPool(
         connection_class=IoBrokerConnection,
         host=cfg.host,
@@ -243,7 +240,7 @@ def connect(cfg: DbConfig) -> redis.Redis:
 
 
 def connect_async(cfg: DbConfig) -> aioredis.Redis:
-    """Baut eine asynchrone Verbindung."""
+    """Open an asynchronous connection."""
     pool = aioredis.ConnectionPool(
         connection_class=AsyncIoBrokerConnection,
         host=cfg.host,
@@ -256,19 +253,19 @@ def connect_async(cfg: DbConfig) -> aioredis.Redis:
 
 
 async def check_protocol(client: aioredis.Redis, section: str) -> str:
-    """Prueft die Protokollversion und dient zugleich als Verbindungstest.
+    """Verify the protocol version; doubles as the connection test.
 
-    Bricht bei Abweichung ab, statt auf gut Glueck weiterzumachen -- ein
-    Protokollwechsel bedeutet, dass die Schluesselformate nicht mehr stimmen.
+    Aborts on mismatch rather than pressing on: a protocol change means the key
+    formats can no longer be relied upon.
     """
     version = await client.get(f"{META_PREFIX}{section}.protocolVersion")
     if version is None:
         raise ConnectionError(
-            f"{section}: keine Protokollversion gefunden -- laeuft ioBroker?"
+            f"{section}: no protocol version found -- is ioBroker running?"
         )
     if version != PROTOCOL_VERSION:
         raise ConnectionError(
-            f"{section}: Protokollversion {version!r}, dieses SDK spricht "
+            f"{section}: protocol version {version!r}, this SDK speaks "
             f"{PROTOCOL_VERSION!r}."
         )
     return version

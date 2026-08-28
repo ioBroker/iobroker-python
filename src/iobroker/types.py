@@ -1,4 +1,4 @@
-"""Datentypen des ioBroker-Objektmodells."""
+"""Data types of the ioBroker object model."""
 
 from __future__ import annotations
 
@@ -10,17 +10,16 @@ __all__ = ["State", "Message", "now_ms"]
 
 
 def now_ms() -> int:
-    """Zeitstempel in Millisekunden -- die Einheit, die ioBroker durchgaengig benutzt."""
+    """Timestamp in milliseconds -- the unit ioBroker uses throughout."""
     return int(time.time() * 1000)
 
 
 @dataclass
 class State:
-    """Ein ioBroker-State.
+    """An ioBroker state.
 
-    ``ack`` traegt die Bedeutung: ``False`` ist ein Befehl an das Geraet,
-    ``True`` eine bestaetigte Rueckmeldung. Wer das verwechselt, baut
-    Endlosschleifen.
+    ``ack`` carries the meaning: ``False`` is a command towards the device,
+    ``True`` a confirmed reading. Confusing the two builds feedback loops.
     """
 
     val: Any
@@ -34,7 +33,7 @@ class State:
     c: str | None = None
 
     def to_wire(self) -> dict[str, Any]:
-        """Serialisiert in die Form, die auch der JS-Client schreibt."""
+        """Serialize into the shape the JS client writes as well."""
         out: dict[str, Any] = {
             "val": self.val,
             "ack": self.ack,
@@ -65,9 +64,9 @@ class State:
 
 @dataclass
 class Message:
-    """Eine Messagebox-Nachricht.
+    """A messagebox message.
 
-    ``callback`` ist gesetzt, wenn der Absender eine Antwort erwartet.
+    ``callback`` is set when the sender expects a reply.
     """
 
     command: str

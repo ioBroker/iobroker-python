@@ -1,8 +1,8 @@
-"""Die Adapter-Basisklasse.
+"""The adapter base class.
 
-Bewusst nah an ``@iobroker/adapter-core``: gleiche Begriffe, gleiche
-Lebenszyklus-Haken, gleiche ``ack``-Semantik. Wer ioBroker-Adapter kennt, soll
-nichts Neues lernen muessen ausser der Sprache.
+Deliberately close to ``@iobroker/adapter-core``: same vocabulary, same
+lifecycle hooks, same ``ack`` semantics. Anyone who knows ioBroker adapters
+should have nothing new to learn but the language.
 
     from iobroker import Adapter
 
@@ -48,7 +48,7 @@ _LEVELS = {"silly": 10, "debug": 10, "info": 20, "warn": 30, "error": 40}
 
 
 class Adapter:
-    """Basisklasse fuer einen Python-Adapter."""
+    """Base class for a Python adapter."""
 
     def __init__(self, name: str, instance: int | None = None) -> None:
         self.name = name
@@ -70,27 +70,27 @@ class Adapter:
 
         self._builtin_states = True
 
-    # -- Lebenszyklus, zum Ueberschreiben ---------------------------------
+    # -- Lifecycle hooks, meant to be overridden --------------------------
 
     async def on_ready(self) -> None:
-        """Verbindung steht, Konfiguration ist geladen."""
+        """Connection is up and the configuration has been loaded."""
 
     async def on_state_change(self, id: str, state: State | None) -> None:
-        """Ein abonnierter State hat sich geaendert. ``None`` heisst geloescht."""
+        """A subscribed state changed. ``None`` means deleted or expired."""
 
     async def on_object_change(self, id: str, obj: dict[str, Any] | None) -> None:
-        """Ein abonniertes Objekt hat sich geaendert."""
+        """A subscribed object changed."""
 
     async def on_message(self, msg: Message) -> None:
-        """Eine Nachricht aus der Messagebox."""
+        """A message arrived through the messagebox."""
 
     async def on_unload(self) -> None:
-        """Letzte Gelegenheit aufzuraeumen, bevor der Prozess endet."""
+        """Last chance to clean up before the process ends."""
 
-    # -- Start ------------------------------------------------------------
+    # -- Startup ----------------------------------------------------------
 
     def run(self) -> None:
-        """Startet den Adapter und blockiert bis zum Ende."""
+        """Start the adapter and block until it stops."""
         try:
             asyncio.run(self._main())
         except KeyboardInterrupt:
@@ -110,7 +110,7 @@ class Adapter:
         self._install_signal_handlers()
 
         self._sub = self._states.pubsub()
-        # Die eigene Messagebox und das Stopp-Signal des Controllers.
+        # Our own messagebox and the controller's stop signal.
         await self._sub.psubscribe(f"{MESSAGE_PREFIX}{self.instance_id}")
         await self._sub.psubscribe(f"{STATES_PREFIX}{self.instance_id}.sigKill")
         self._pump = asyncio.create_task(self._pump_events())
@@ -119,7 +119,7 @@ class Adapter:
         await self._set_alive(True)
         self._alive = asyncio.create_task(self._heartbeat())
 
-        self.log.info(f"Adapter {self.namespace} gestartet (PID {os.getpid()})")
+        self.log.info(f"Adapter {self.namespace} started (PID {os.getpid()})")
         try:
             await self.on_ready()
             await self._stopping.wait()
@@ -127,7 +127,7 @@ class Adapter:
             await self._shutdown()
 
     async def _load_config(self) -> None:
-        """Liest ``native`` aus dem Instanzobjekt in ``self.config``."""
+        """Read ``native`` from the instance object into ``self.config``."""
         obj = await self.get_foreign_object(self.instance_id)
         if obj:
             self.config = obj.get("native") or {}
@@ -138,7 +138,7 @@ class Adapter:
     # -- States -----------------------------------------------------------
 
     def _abs(self, id: str) -> str:
-        """Ergaenzt den eigenen Namespace, wenn die ID nicht schon absolut ist."""
+        """Prepend our own namespace unless the id is already absolute."""
         if id.startswith(f"{self.namespace}.") or id.startswith("system."):
             return id
         return f"{self.namespace}.{id}"
@@ -146,16 +146,16 @@ class Adapter:
     async def set_state(
         self, id: str, val: Any, ack: bool = False, expire: int | None = None
     ) -> None:
-        """Schreibt einen eigenen State."""
+        """Write one of our own states."""
         await self.set_foreign_state(self._abs(id), val, ack=ack, expire=expire)
 
     async def set_foreign_state(
         self, id: str, val: Any, ack: bool = False, expire: int | None = None
     ) -> None:
-        """Schreibt einen beliebigen State.
+        """Write an arbitrary state.
 
-        Schreiben und Benachrichtigen laufen in einem MULTI -- der JS-Client
-        macht es genauso, und setState ist der heisseste Pfad im System.
+        Writing and publishing go into a single MULTI -- the JS client does the
+        same, and setState is the hottest path in the system.
         """
         state = val if isinstance(val, State) else State(val=val, ack=ack)
         state.from_ = state.from_ or self.instance_id
@@ -180,13 +180,13 @@ class Adapter:
         return State.from_wire(json.loads(raw))
 
     async def subscribe_states(self, pattern: str = "*") -> None:
-        """Abonniert eigene States."""
+        """Subscribe to our own states."""
         await self.subscribe_foreign_states(f"{self.namespace}.{pattern}")
 
     async def subscribe_foreign_states(self, pattern: str) -> None:
         await self._sub.psubscribe(f"{STATES_PREFIX}{pattern}")
 
-    # -- Objekte ----------------------------------------------------------
+    # -- Objects ----------------------------------------------------------
 
     async def get_object(self, id: str) -> dict[str, Any] | None:
         return await self.get_foreign_object(self._abs(id))
@@ -199,10 +199,10 @@ class Adapter:
         await self.set_foreign_object(self._abs(id), obj)
 
     async def set_foreign_object(self, id: str, obj: dict[str, Any]) -> None:
-        """Legt ein Objekt an oder ueberschreibt es.
+        """Create or overwrite an object.
 
-        Pflegt die Index-Sets mit, sofern die Installation sie benutzt --
-        sonst fehlen die Objekte spaeter in ``getObjectView``.
+        Maintains the index sets when the installation uses them -- otherwise
+        the objects would be missing from ``getObjectView`` later on.
         """
         obj = dict(obj)
         obj["_id"] = id
@@ -224,22 +224,22 @@ class Adapter:
                     )
 
     async def set_object_not_exists(self, id: str, obj: dict[str, Any]) -> bool:
-        """Legt das Objekt nur an, wenn es noch nicht existiert.
+        """Create the object only if it does not exist yet.
 
-        Gibt zurueck, ob geschrieben wurde -- so bleiben Nutzeranpassungen an
-        ``common`` bei jedem Start erhalten.
+        Returns whether it was written -- this is what keeps user edits to
+        ``common`` from being reset on every start.
         """
         if await self.get_object(id) is not None:
             return False
         await self.set_object(id, obj)
         return True
 
-    # -- Nachrichten ------------------------------------------------------
+    # -- Messages ---------------------------------------------------------
 
     async def send_to(
         self, target: str, command: str, message: Any = None
     ) -> None:
-        """Schickt eine Nachricht an eine andere Instanz."""
+        """Send a message to another instance."""
         payload = {
             "command": command,
             "message": message,
@@ -251,7 +251,7 @@ class Adapter:
         )
 
     async def reply(self, msg: Message, result: Any) -> None:
-        """Beantwortet eine Nachricht, die eine Antwort erwartet."""
+        """Answer a message that expects a reply."""
         if not msg.callback:
             return
         callback = dict(msg.callback)
@@ -264,10 +264,10 @@ class Adapter:
         }
         await self._states.publish(f"{MESSAGE_PREFIX}{msg.from_}", json.dumps(payload))
 
-    # -- Ereignisschleife -------------------------------------------------
+    # -- Event loop -------------------------------------------------------
 
     async def _pump_events(self) -> None:
-        """Verteilt eingehende Pub/Sub-Nachrichten auf die Lebenszyklus-Haken."""
+        """Route incoming pub/sub messages to the lifecycle hooks."""
         try:
             async for raw in self._sub.listen():
                 if raw.get("type") != "pmessage":
@@ -277,11 +277,11 @@ class Adapter:
                 try:
                     await self._dispatch(channel, data)
                 except Exception:  # noqa: BLE001
-                    self.log.error(f"Fehler beim Verarbeiten von {channel}", exc_info=True)
+                    self.log.error(f"Failed to handle {channel}", exc_info=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            self.log.error(f"Ereignisschleife abgebrochen: {exc}")
+            self.log.error(f"Event loop aborted: {exc}")
             self._stopping.set()
 
     async def _dispatch(self, channel: str, data: str) -> None:
@@ -299,35 +299,35 @@ class Adapter:
             )
             return
 
-        # Der eingebaute Server liefert den Kanal ohne "io."-Praefix, echtes
-        # Redis mit. Der JS-Client toleriert beides -- wir auch.
+        # The built-in server delivers the channel without the "io." prefix,
+        # real Redis delivers it with. The JS client tolerates both -- so do we.
         state_id = channel[len(STATES_PREFIX):] if channel.startswith(STATES_PREFIX) else channel
 
-        # Stopp-Signal des Controllers: sigKill == -1 heisst "beende dich".
+        # Controller stop signal: sigKill == -1 means "terminate yourself".
         if state_id == f"{self.instance_id}.sigKill":
             if data and data != "null":
                 with contextlib.suppress(Exception):
                     if int(json.loads(data).get("val", 0)) == -1:
-                        self.log.info("sigKill empfangen -- beende Adapter")
+                        self.log.info("sigKill received -- shutting down")
                         self._stopping.set()
             return
 
-        # Ablauf: der eingebaute Server publiziert beim Ablauf "null" auf dem
-        # State-Kanal selbst. Echtes Redis meldet stattdessen ueber
-        # __keyevent@<db>__:expired -- dort waere ein eigenes Abo noetig.
+        # Expiry: the built-in server publishes "null" on the state channel
+        # itself. Real Redis instead reports through __keyevent@<db>__:expired,
+        # which would need a separate subscription.
         if not data or data == "null":
             await self.on_state_change(state_id, None)
             return
 
         await self.on_state_change(state_id, State.from_wire(json.loads(data)))
 
-    # -- Lebenszeichen ----------------------------------------------------
+    # -- Heartbeat --------------------------------------------------------
 
     async def _set_alive(self, alive: bool) -> None:
         await self.set_foreign_state(f"{self.instance_id}.alive", alive, ack=True)
 
     async def _heartbeat(self) -> None:
-        """Haelt alive/uptime/memRss aktuell -- wie ein Node-Adapter auch."""
+        """Keep alive/uptime/memRss current -- just like a Node adapter does."""
         try:
             while not self._stopping.is_set():
                 await asyncio.sleep(15)
@@ -345,7 +345,7 @@ class Adapter:
         except asyncio.CancelledError:
             raise
 
-    # -- Ende -------------------------------------------------------------
+    # -- Shutdown ---------------------------------------------------------
 
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
@@ -357,11 +357,11 @@ class Adapter:
                 loop.add_signal_handler(sig, self._stopping.set)
 
     def stop(self) -> None:
-        """Beendet den Adapter geordnet."""
+        """Shut the adapter down in an orderly fashion."""
         self._stopping.set()
 
     async def _shutdown(self) -> None:
-        self.log.info(f"Adapter {self.namespace} wird beendet")
+        self.log.info(f"Adapter {self.namespace} is shutting down")
         with contextlib.suppress(Exception):
             await self.on_unload()
         for task in (self._alive, self._pump):
@@ -380,10 +380,10 @@ class Adapter:
 
 
 class _Log:
-    """Logger, der nach stdout und auf den ``log.``-Kanal schreibt.
+    """Logger writing both to stdout and to the ``log.`` channel.
 
-    Beides wird gebraucht: der Kanal erreicht die Log-Transporter, stdout faengt
-    alles auf, was fremde Bibliotheken ungefiltert ausgeben.
+    Both are needed: the channel reaches the log transporters, while stdout
+    catches everything third-party libraries print unfiltered.
     """
 
     def __init__(self, adapter: "Adapter") -> None:
@@ -435,7 +435,7 @@ class _Log:
 
 
 # --------------------------------------------------------------------------
-# Hilfsfunktionen
+# Helpers
 # --------------------------------------------------------------------------
 
 def _cli() -> argparse.Namespace:
@@ -447,7 +447,7 @@ def _cli() -> argparse.Namespace:
 
 
 def _read_instance() -> int:
-    """Instanznummer aus ``--instance`` oder ``IOB_INSTANCE``."""
+    """Instance number from ``--instance`` or ``IOB_INSTANCE``."""
     env = os.environ.get("IOB_INSTANCE")
     if env is not None:
         return int(env)
@@ -460,16 +460,16 @@ def _read_loglevel() -> str:
 
 
 def _rss_mb() -> float | None:
-    """Speicherverbrauch in MB, ohne harte Abhaengigkeit auf psutil."""
+    """Memory usage in MB, without a hard dependency on psutil."""
     try:
         import resource  # POSIX
 
         usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # Linux liefert KB, macOS Bytes.
+        # Linux reports KB, macOS reports bytes.
         return round(usage / (1024 if sys.platform != "darwin" else 1024 * 1024), 2)
     except ImportError:
         try:
-            import psutil  # optional, u.a. fuer Windows
+            import psutil  # optional, mainly for Windows
 
             return round(psutil.Process().memory_info().rss / (1024 * 1024), 2)
         except Exception:  # noqa: BLE001

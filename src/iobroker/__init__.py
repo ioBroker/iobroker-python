@@ -1,7 +1,7 @@
-"""iobroker -- Python-SDK fuer ioBroker-Adapter.
+"""iobroker -- Python SDK for ioBroker adapters.
 
-Redet direkt das Redis-Wire-Protokoll der States- und Objects-Datenbank und
-macht Python-Prozesse damit zu gleichrangigen Adaptern neben Node.
+Speaks the Redis wire protocol of the states and objects databases directly,
+making Python processes first-class adapters alongside Node.
 """
 
 from .adapter import Adapter
@@ -14,7 +14,7 @@ from .connection import (
 )
 from .types import Message, State, now_ms
 
-#: Einzige Quelle der Versionsnummer -- pyproject.toml liest sie hier aus.
+#: Single source of the version number -- pyproject.toml reads it from here.
 __version__ = "0.1.1"
 
 __all__ = [
