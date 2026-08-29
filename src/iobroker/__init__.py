@@ -17,7 +17,7 @@ from .files import FileMeta
 from .types import Message, State, now_ms
 
 #: Single source of the version number -- pyproject.toml reads it from here.
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "Adapter",

@@ -41,6 +41,7 @@ from .connection import (
     connect_async,
     load_db_config,
 )
+from .protection import strip_protected
 from .files import (
     FILE_SEPARATOR,
     FileMeta,
@@ -277,8 +278,19 @@ class Adapter:
         return await self.get_foreign_object(self._abs(id))
 
     async def get_foreign_object(self, id: str) -> dict[str, Any] | None:
+        """Read an arbitrary object.
+
+        Entries another adapter listed in ``common.protectedNative`` are removed on the way out.
+        ioBroker enforces that in the client, not in the database, and this SDK talks to the
+        database directly -- so without doing it here, reading a foreign instance object would hand
+        over exactly what the flag exists to withhold.
+        """
         raw = await self._objects.get(f"{OBJECTS_PREFIX}{id}")
-        return json.loads(raw) if raw else None
+
+        if not raw:
+            return None
+
+        return strip_protected(self.name, id, json.loads(raw))
 
     async def set_object(self, id: str, obj: dict[str, Any]) -> None:
         await self.set_foreign_object(self._abs(id), obj)
@@ -391,8 +403,13 @@ class Adapter:
             return []
 
         raw = await self._objects.mget(wanted)
+        objects = [json.loads(r) for r in raw if r]
 
-        return [json.loads(r) for r in raw if r]
+        return [
+            stripped
+            for obj in objects
+            if (stripped := strip_protected(self.name, obj.get("_id", ""), obj)) is not None
+        ]
 
     async def _view_keys(self, view: str) -> list[str]:
         """Collect the object keys of one type, from the index when there is one."""

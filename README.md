@@ -82,6 +82,13 @@ JS client, not in the database server.** Anything holding a Redis connection
 effectively has admin rights. That is equally true for Node adapters — the
 difference is that with Python, third-party code from PyPI shares the process.
 
+The same applies to `common.protectedNative`: those entries are withheld by the
+client, so reading a foreign instance object straight from the database would
+hand over exactly what the flag exists to keep back. `get_foreign_object` and
+`get_object_view` therefore strip them, following the rule
+`@iobroker/adapter-core` uses — an adapter still sees its own settings, and
+`admin`, `iot`, `cloud` and `discovery` stay exempt.
+
 ## Capability probe
 
 ```bash
