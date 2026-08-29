@@ -16,7 +16,7 @@ from .crypto import decrypt
 from .types import Message, State, now_ms
 
 #: Single source of the version number -- pyproject.toml reads it from here.
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Adapter",

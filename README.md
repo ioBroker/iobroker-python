@@ -120,6 +120,22 @@ It is optional because it is compiled, and on a Raspberry Pi that is the differe
 install and a long build — an adapter without encrypted settings should not pay for it. If a value
 turns out to need it and it is missing, the error says so.
 
+## Objects
+
+Beyond `get_object` / `set_object` / `set_object_not_exists`:
+
+| | |
+|---|---|
+| `extend_object(id, patch)` | merges into an existing object; `common` and `native` key by key, so one field can be changed without overwriting what a user edited |
+| `delete_object(id)` | removes it and keeps the type index in step |
+| `get_adapter_objects()` | every object in the adapter's own namespace |
+| `get_object_view("system", type)` | objects of one type within an id range |
+| `subscribe_objects(pattern)` | notices configuration changes made while the adapter runs, delivered to `on_object_change` |
+
+`get_object_view` reads the type index sets rather than running Lua the way the JavaScript client
+does — the states database cannot run Lua at all and the objects database only sometimes can. Where
+the sets are switched off it falls back to scanning.
+
 ## Lifecycle
 
 `alive`, `connected`, `uptime` and `memRss` are written by the adapter itself

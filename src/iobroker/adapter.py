@@ -72,6 +72,14 @@ class Adapter:
         self._builtin_states = True
         self._secret: str | None = None
 
+        # Kept so subscriptions can be restored after a reconnect. redis-py restores its own
+        # record, but the built-in server echoes patterns back in a different form than it was
+        # given, so relying on that bookkeeping is not safe here.
+        self._state_patterns: set[str] = set()
+        self._object_patterns: set[str] = set()
+        self._osub: Any = None
+        self._opump: asyncio.Task | None = None
+
     # -- Lifecycle hooks, meant to be overridden --------------------------
 
     async def on_ready(self) -> None:
@@ -111,11 +119,15 @@ class Adapter:
         await self._load_config()
         self._install_signal_handlers()
 
-        self._sub = self._states.pubsub()
         # Our own messagebox and the controller's stop signal.
-        await self._sub.psubscribe(f"{MESSAGE_PREFIX}{self.instance_id}")
-        await self._sub.psubscribe(f"{STATES_PREFIX}{self.instance_id}.sigKill")
-        self._pump = asyncio.create_task(self._pump_events())
+        self._state_patterns.add(f"{MESSAGE_PREFIX}{self.instance_id}")
+        self._state_patterns.add(f"{STATES_PREFIX}{self.instance_id}.sigKill")
+
+        self._sub = await self._open_subscription(self._states, self._state_patterns)
+        self._pump = asyncio.create_task(self._run_pump("states"))
+
+        self._osub = await self._open_subscription(self._objects, self._object_patterns)
+        self._opump = asyncio.create_task(self._run_pump("objects"))
 
         await self.set_state("info.connection", False, ack=True)
         await self._set_alive(True)
@@ -229,7 +241,22 @@ class Adapter:
         await self.subscribe_foreign_states(f"{self.namespace}.{pattern}")
 
     async def subscribe_foreign_states(self, pattern: str) -> None:
-        await self._sub.psubscribe(f"{STATES_PREFIX}{pattern}")
+        full = f"{STATES_PREFIX}{pattern}"
+        self._state_patterns.add(full)
+        await self._sub.psubscribe(full)
+
+    async def subscribe_objects(self, pattern: str = "*") -> None:
+        """Subscribe to changes of our own objects."""
+        await self.subscribe_foreign_objects(f"{self.namespace}.{pattern}")
+
+    async def subscribe_foreign_objects(self, pattern: str) -> None:
+        """Subscribe to changes of arbitrary objects.
+
+        Needed to notice configuration changes made in the admin UI while the adapter runs.
+        """
+        full = f"{OBJECTS_PREFIX}{pattern}"
+        self._object_patterns.add(full)
+        await self._osub.psubscribe(full)
 
     # -- Objects ----------------------------------------------------------
 
@@ -279,6 +306,129 @@ class Adapter:
         await self.set_object(id, obj)
         return True
 
+    async def extend_object(self, id: str, patch: dict[str, Any]) -> None:
+        """Merge a patch into an existing object.
+
+        Shallow per section: ``common`` and ``native`` are merged key by key, everything else is
+        replaced. That is what ``extendObject`` does in JavaScript, and adapters rely on it to
+        change one field without rewriting an object a user may have edited.
+        """
+        current = await self.get_foreign_object(self._abs(id)) or {}
+        merged = {**current}
+
+        for key, value in patch.items():
+            if key in ("common", "native") and isinstance(value, dict):
+                merged[key] = {**(current.get(key) or {}), **value}
+            else:
+                merged[key] = value
+
+        await self.set_foreign_object(self._abs(id), merged)
+
+    async def delete_object(self, id: str) -> None:
+        """Remove one of our own objects."""
+        await self.delete_foreign_object(self._abs(id))
+
+    async def delete_foreign_object(self, id: str) -> None:
+        """Remove an arbitrary object, keeping the type index in step."""
+        key = f"{OBJECTS_PREFIX}{id}"
+        obj = await self.get_foreign_object(id)
+
+        await self._objects.delete(key)
+        await self._objects.publish(key, "null")
+
+        # Leaving the id in the type set would make it show up in views pointing at nothing.
+        if obj and obj.get("type"):
+            with contextlib.suppress(Exception):
+                await self._objects.srem(f"{SETS_PREFIX}object.type.{obj['type']}", key)
+
+    async def delete_state(self, id: str) -> None:
+        """Remove one of our own states."""
+        await self.delete_foreign_state(self._abs(id))
+
+    async def delete_foreign_state(self, id: str) -> None:
+        """Remove an arbitrary state."""
+        key = f"{STATES_PREFIX}{id}"
+        await self._states.delete(key)
+        await self._states.publish(key, "null")
+
+    async def get_object_view(
+        self, design: str, view: str, startkey: str = "", endkey: str = "香"
+    ) -> list[dict[str, Any]]:
+        """List objects of one type within an id range.
+
+        Only the ``system`` design is supported, where the view name is the object type -- that is
+        what adapters actually use. The JavaScript client runs Lua for this; here the type index
+        sets are read instead, because the states database cannot run Lua at all and the objects
+        database only sometimes can. Where the sets are switched off it falls back to scanning.
+
+        :param design: must be ``system``
+        :param view: object type, e.g. ``state``, ``channel``, ``device``, ``instance``
+        :param startkey: lowest id to include
+        :param endkey: highest id to include
+        :returns: the matching objects
+        """
+        if design != "system":
+            raise ValueError(f'Only the "system" design is supported, got "{design}"')
+
+        keys = await self._view_keys(view)
+        ids = sorted(k[len(OBJECTS_PREFIX) :] for k in keys)
+        wanted = [f"{OBJECTS_PREFIX}{i}" for i in ids if startkey <= i <= endkey]
+
+        if not wanted:
+            return []
+
+        raw = await self._objects.mget(wanted)
+
+        return [json.loads(r) for r in raw if r]
+
+    async def _view_keys(self, view: str) -> list[str]:
+        """Collect the object keys of one type, from the index when there is one."""
+        use_sets = await self._objects.get("meta.objects.features.useSets")
+
+        if use_sets and int(use_sets):
+            with contextlib.suppress(Exception):
+                members = await self._objects.smembers(f"{SETS_PREFIX}object.type.{view}")
+                if members:
+                    return list(members)
+
+        # No index: walk everything and filter. Expensive, but the alternative is returning
+        # nothing on an installation that has the sets switched off.
+        keys: list[str] = []
+        cursor = 0
+
+        while True:
+            cursor, batch = await self._objects.scan(cursor=cursor, match=f"{OBJECTS_PREFIX}*", count=500)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+
+        if not keys:
+            return []
+
+        raw = await self._objects.mget(keys)
+
+        return [
+            key
+            for key, value in zip(keys, raw)
+            if value and json.loads(value).get("type") == view
+        ]
+
+    async def get_adapter_objects(self) -> dict[str, dict[str, Any]]:
+        """Read every object in our own namespace, keyed by id."""
+        pattern = f"{OBJECTS_PREFIX}{self.namespace}.*"
+        keys = await self._objects.keys(pattern)
+
+        if not keys:
+            return {}
+
+        raw = await self._objects.mget(keys)
+
+        return {
+            key[len(OBJECTS_PREFIX) :]: json.loads(value)
+            for key, value in zip(keys, raw)
+            if value
+        }
+
     # -- Messages ---------------------------------------------------------
 
     async def send_to(
@@ -311,25 +461,104 @@ class Adapter:
 
     # -- Event loop -------------------------------------------------------
 
-    async def _pump_events(self) -> None:
-        """Route incoming pub/sub messages to the lifecycle hooks."""
-        try:
-            async for raw in self._sub.listen():
-                if raw.get("type") != "pmessage":
-                    continue
-                channel: str = raw["channel"]
-                data: str = raw["data"]
-                try:
-                    await self._dispatch(channel, data)
-                except Exception:  # noqa: BLE001
-                    self.log.error(f"Failed to handle {channel}", exc_info=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            self.log.error(f"Event loop aborted: {exc}")
-            self._stopping.set()
+    async def _open_subscription(self, client: Any, patterns: set[str]) -> Any:
+        """Open a pub/sub connection and apply the recorded patterns."""
+        sub = client.pubsub()
+
+        for pattern in patterns:
+            await sub.psubscribe(pattern)
+
+        return sub
+
+    async def _run_pump(self, kind: str) -> None:
+        """Consume one pub/sub stream for as long as the adapter runs.
+
+        Measured, not assumed: redis-py restores a dropped subscription by itself, and an adapter
+        survives the database going away and coming back without any help from here. This loop is
+        the backstop for the case where an error does escape ``listen()`` -- previously that ended
+        the adapter, which cost a process restart and everything it held in memory.
+
+        The backoff is capped rather than unbounded: an adapter that retries every 30 seconds
+        during a long outage is preferable to one that has backed off to an hour and stays dark
+        long after the database returned.
+        """
+        delay = 1.0
+
+        while not self._stopping.is_set():
+            sub = self._sub if kind == "states" else self._osub
+            patterns = self._state_patterns if kind == "states" else self._object_patterns
+
+            # listen() over a subscription with no patterns returns at once, which would turn this
+            # into a busy loop. Most adapters never subscribe to objects, so this is the normal
+            # case rather than an edge one.
+            if not patterns:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._stopping.wait(), timeout=1.0)
+                continue
+
+            try:
+                async for raw in sub.listen():
+                    if raw.get("type") != "pmessage":
+                        continue
+
+                    delay = 1.0  # a message proves the connection works
+
+                    try:
+                        await self._dispatch(raw["channel"], raw["data"])
+                    except Exception:  # noqa: BLE001
+                        self.log.error(f"Failed to handle {raw['channel']}", exc_info=True)
+
+                if self._stopping.is_set():
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if self._stopping.is_set():
+                    return
+                self.log.warn(f"{kind} subscription lost ({exc}); reconnecting in {delay:.0f}s")
+
+            if self._stopping.is_set():
+                return
+
+            # Wait, but wake immediately when the adapter is asked to stop -- otherwise a shutdown
+            # during an outage would hang for the length of the backoff.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stopping.wait(), timeout=delay)
+
+            if self._stopping.is_set():
+                return
+
+            delay = min(delay * 2, 30.0)
+
+            try:
+                client = self._states if kind == "states" else self._objects
+
+                with contextlib.suppress(Exception):
+                    await sub.aclose()
+
+                new_sub = await self._open_subscription(client, patterns)
+
+                if kind == "states":
+                    self._sub = new_sub
+                else:
+                    self._osub = new_sub
+
+                # The backoff is deliberately not reset here. Reopening a subscription succeeds
+                # even while the database is still gone, so resetting on that would keep retrying
+                # every second for the whole outage. Only a message that actually arrives proves
+                # the connection works, and that is where it resets.
+                self.log.info(f"{kind} subscription reopened ({len(patterns)} pattern(s))")
+            except Exception as exc:  # noqa: BLE001
+                self.log.warn(f"Could not reopen the {kind} subscription: {exc}")
 
     async def _dispatch(self, channel: str, data: str) -> None:
+        # Object changes arrive on the objects connection and keep their prefix, unlike states.
+        if channel.startswith(OBJECTS_PREFIX):
+            obj_id = channel[len(OBJECTS_PREFIX) :]
+            obj = None if not data or data == "null" else json.loads(data)
+            await self.on_object_change(obj_id, obj)
+            return
+
         # Normalise the channel before deciding what it is. The two servers disagree about the
         # "io." prefix, and in opposite directions:
         #
@@ -420,7 +649,7 @@ class Adapter:
         self.log.info(f"Adapter {self.namespace} is shutting down")
         with contextlib.suppress(Exception):
             await self.on_unload()
-        for task in (self._alive, self._pump):
+        for task in (self._alive, self._pump, self._opump):
             if task:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -429,7 +658,7 @@ class Adapter:
             await self.set_state("info.connection", False, ack=True)
         with contextlib.suppress(Exception):
             await self._set_alive(False)
-        for closable in (self._sub, self._states, self._objects):
+        for closable in (self._sub, self._osub, self._states, self._objects):
             if closable is not None:
                 with contextlib.suppress(Exception):
                     await closable.aclose()
