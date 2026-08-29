@@ -31,6 +31,7 @@ import time
 from typing import Any
 
 from .connection import (
+    FILES_PREFIX,
     LOG_PREFIX,
     MESSAGE_PREFIX,
     OBJECTS_PREFIX,
@@ -39,6 +40,14 @@ from .connection import (
     check_protocol,
     connect_async,
     load_db_config,
+)
+from .files import (
+    FILE_SEPARATOR,
+    FileMeta,
+    file_key,
+    guess_mime_type,
+    normalize_name,
+    split_file_key,
 )
 from .crypto import decrypt, decrypt_native
 from .types import Message, State, now_ms
@@ -79,6 +88,9 @@ class Adapter:
         self._object_patterns: set[str] = set()
         self._osub: Any = None
         self._opump: asyncio.Task | None = None
+        # Opened on first use: file content must not be decoded as text.
+        self._files: Any = None
+        self._objects_cfg: Any = None
 
     # -- Lifecycle hooks, meant to be overridden --------------------------
 
@@ -111,6 +123,7 @@ class Adapter:
         objects_cfg = load_db_config("objects")
         self._builtin_states = states_cfg.is_builtin
 
+        self._objects_cfg = objects_cfg
         self._states = connect_async(states_cfg)
         self._objects = connect_async(objects_cfg)
         await check_protocol(self._states, "states")
@@ -429,6 +442,135 @@ class Adapter:
             if value
         }
 
+    # -- Files ------------------------------------------------------------
+
+    def _file_client(self) -> Any:
+        """The byte-mode connection used for file content.
+
+        Opened lazily: most adapters never touch files, and a second connection per adapter is not
+        free on a small installation.
+        """
+        if self._files is None:
+            self._files = connect_async(self._objects_cfg, decode=False)
+
+        return self._files
+
+    async def write_file(
+        self, id: str, name: str, data: bytes | str, mime_type: str | None = None
+    ) -> None:
+        """Store a file in the object database.
+
+        Files live in the database rather than on disk, which is what makes them survive a backup
+        and reach every host in a multihost setup.
+
+        :param id: owning id; pass the adapter namespace for its own files
+        :param name: path within that id, e.g. ``icons/lamp.png``
+        :param data: content, as bytes or text
+        :param mime_type: override the type derived from the extension
+        """
+        is_text = isinstance(data, str)
+        payload = data.encode() if is_text else data
+        guessed, binary = guess_mime_type(name, is_text)
+        now = now_ms()
+
+        existing = await self.read_file_meta(id, name)
+        meta = FileMeta(
+            size=len(payload),
+            mime_type=mime_type or guessed,
+            binary=binary,
+            created_at=existing.created_at if existing else now,
+            modified_at=now,
+            acl=existing.acl if existing else None,
+        )
+
+        data_key = file_key(FILES_PREFIX, id, name, "data")
+        meta_key = file_key(FILES_PREFIX, id, name, "meta")
+
+        client = self._file_client()
+        await client.set(data_key, payload)
+        # The JavaScript client publishes the byte length here, not the content.
+        await client.publish(data_key, str(len(payload)))
+        await self._objects.set(meta_key, json.dumps(meta.to_wire()))
+
+    async def read_file(self, id: str, name: str) -> bytes | None:
+        """Read a file's content.
+
+        Always bytes, never text: the caller knows whether it stored an image or a JSON document,
+        this layer does not, and guessing would corrupt one of the two.
+
+        :param id: owning id
+        :param name: path within that id
+        """
+        return await self._file_client().get(file_key(FILES_PREFIX, id, name, "data"))
+
+    async def read_file_meta(self, id: str, name: str) -> FileMeta | None:
+        """Read what is recorded about a file, without its content.
+
+        :param id: owning id
+        :param name: path within that id
+        """
+        raw = await self._objects.get(file_key(FILES_PREFIX, id, name, "meta"))
+
+        return FileMeta.from_wire(json.loads(raw)) if raw else None
+
+    async def unlink(self, id: str, name: str) -> None:
+        """Delete a file, both its content and its metadata.
+
+        :param id: owning id
+        :param name: path within that id
+        """
+        await self._file_client().delete(file_key(FILES_PREFIX, id, name, "data"))
+        await self._objects.delete(file_key(FILES_PREFIX, id, name, "meta"))
+
+    async def read_dir(self, id: str, path: str = "") -> list[dict[str, Any]]:
+        """List one level of the file store.
+
+        The built-in server does not glob file keys the way it globs object keys: it treats the
+        pattern as a directory and answers with one level of entries. Measured rather than assumed,
+        because getting the shape wrong returns an empty list instead of an error --
+
+            keys("cfg.f.<id>$%$*")          -> the top level
+            keys("cfg.f.<id>$%$icons/*")    -> inside "icons"
+            keys("cfg.f.<id>$%$icons")      -> nothing at all
+
+        Subdirectories come back as a synthetic ``<dir>/_data.json`` entry, which is how they are
+        told apart from files here.
+
+        :param id: owning id
+        :param path: directory within that id; empty for the top level
+        :returns: one entry per name, each with ``file`` and ``is_dir``
+        """
+        prefix = normalize_name(path)
+
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+
+        keys = await self._objects.keys(f"{FILES_PREFIX}{id}{FILE_SEPARATOR}{prefix}*")
+        entries: dict[str, bool] = {}
+
+        for key in keys:
+            parts = split_file_key(FILES_PREFIX, key)
+
+            if not parts:
+                continue
+
+            name = parts[1]
+
+            # Only the meta half is listed; data and meta describe the same entry.
+            if parts[2] != "meta":
+                continue
+
+            relative = name[len(prefix) :] if prefix and name.startswith(prefix) else name
+
+            if relative.endswith("_data.json"):
+                directory = relative[: -len("_data.json")].rstrip("/")
+                if directory:
+                    entries[directory] = True
+            elif relative:
+                entries[relative] = False
+
+        return [{"file": name, "is_dir": is_dir} for name, is_dir in sorted(entries.items())]
+
     # -- Messages ---------------------------------------------------------
 
     async def send_to(
@@ -658,7 +800,7 @@ class Adapter:
             await self.set_state("info.connection", False, ack=True)
         with contextlib.suppress(Exception):
             await self._set_alive(False)
-        for closable in (self._sub, self._osub, self._states, self._objects):
+        for closable in (self._sub, self._osub, self._states, self._objects, self._files):
             if closable is not None:
                 with contextlib.suppress(Exception):
                     await closable.aclose()

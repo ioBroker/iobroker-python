@@ -13,10 +13,11 @@ from .connection import (
     load_db_config,
 )
 from .crypto import decrypt
+from .files import FileMeta
 from .types import Message, State, now_ms
 
 #: Single source of the version number -- pyproject.toml reads it from here.
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Adapter",
@@ -29,5 +30,6 @@ __all__ = [
     "load_db_config",
     "now_ms",
     "decrypt",
+    "FileMeta",
     "__version__",
 ]

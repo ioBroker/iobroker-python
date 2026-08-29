@@ -239,15 +239,24 @@ def connect(cfg: DbConfig) -> redis.Redis:
     return redis.Redis(connection_pool=pool)
 
 
-def connect_async(cfg: DbConfig) -> aioredis.Redis:
-    """Open an asynchronous connection."""
+def connect_async(cfg: DbConfig, decode: bool = True) -> aioredis.Redis:
+    """Open an asynchronous connection.
+
+    :param cfg: which database to connect to
+    :param decode: whether replies are decoded as text. Objects and states are JSON and want that;
+        file content does not -- decoding a PNG as UTF-8 destroys it, so the file store opens a
+        second connection with this off.
+    """
+    kwargs = dict(_POOL_KWARGS)
+    kwargs["decode_responses"] = decode
+
     pool = aioredis.ConnectionPool(
         connection_class=AsyncIoBrokerConnection,
         host=cfg.host,
         port=cfg.port,
         db=cfg.db,
         password=cfg.password,
-        **_POOL_KWARGS,
+        **kwargs,
     )
     return aioredis.Redis(connection_pool=pool)
 

@@ -136,6 +136,31 @@ Beyond `get_object` / `set_object` / `set_object_not_exists`:
 does — the states database cannot run Lua at all and the objects database only sometimes can. Where
 the sets are switched off it falls back to scanning.
 
+## Files
+
+ioBroker keeps files in the objects database rather than on disk, which is what makes them survive
+a backup and reach every host in a multihost setup.
+
+```python
+await self.write_file(self.namespace, "icons/lamp.png", png_bytes)
+data = await self.read_file(self.namespace, "icons/lamp.png")   # always bytes
+await self.read_dir(self.namespace, "icons")                    # [{'file': 'lamp.png', 'is_dir': False}]
+await self.unlink(self.namespace, "icons/lamp.png")
+```
+
+`read_file` returns bytes, never text: the caller knows whether it stored an image or a JSON
+document, this layer does not, and guessing would corrupt one of the two. For the same reason files
+use their own connection with decoding switched off — the connections carrying objects and states
+decode replies as text, which would destroy a PNG.
+
+Two things about the built-in server are worth knowing, both measured rather than assumed:
+
+- **File keys are not globbed.** `keys("cfg.f.<id>$%$*")` returns one directory level, and
+  `keys("cfg.f.<id>$%$icons")` returns nothing at all — the working form for a subdirectory is
+  `icons/*`. Getting it wrong yields an empty list, not an error.
+- **Subdirectories appear as a synthetic `<dir>/_data.json` entry**, which is how `read_dir` tells
+  them apart from files.
+
 ## Lifecycle
 
 `alive`, `connected`, `uptime` and `memRss` are written by the adapter itself
