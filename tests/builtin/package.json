@@ -1,0 +1,12 @@
+{
+    "name": "iobroker-python-builtin-fixture",
+    "private": true,
+    "type": "module",
+    "description": "Boots the built-in js-controller databases for the Python test suite",
+    "dependencies": {
+        "@iobroker/db-objects-jsonl": "^7.0.0",
+        "@iobroker/db-states-jsonl": "^7.0.0",
+        "iobroker.js-controller": "file:./controller-stub",
+        "readline-sync": "^1.4.10"
+    }
+}

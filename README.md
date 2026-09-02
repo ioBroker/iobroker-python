@@ -174,7 +174,9 @@ Two things about the built-in server are worth knowing, both measured rather tha
 through the states database — exactly like a Node adapter. Stopping goes through
 the `sigKill` state: when the controller sets it to `-1`, the adapter shuts down
 in an orderly fashion. That makes stopping work on Windows too, where there is
-no `SIGTERM`.
+no `SIGTERM`. Any other value is the PID the controller believes it supervises:
+when that is not the adapter's own PID, another supervisor has taken over and
+the stale process shuts down as well — the behaviour of `adapter-core`.
 
 ## Development
 
@@ -187,6 +189,39 @@ python examples/minimal_adapter.py --instance 0
 The version number lives in `src/iobroker/__init__.py` only; `pyproject.toml`
 reads it from there through hatch, and the release workflow checks the git tag
 against it.
+
+### Tests
+
+```bash
+pytest
+```
+
+The unit tests run everywhere. The database tests run against **two backends**
+and are parametrized over both, because both are what a real installation runs:
+
+- **`redis`** — a real Redis, as a large installation runs. Defaults to
+  `127.0.0.1:6379`, database `15`; override with `IOB_TEST_REDIS_HOST` /
+  `IOB_TEST_REDIS_PORT` / `IOB_TEST_REDIS_DB`. That database is flushed between
+  tests, so it must be dedicated to the suite; if it contains anything the suite
+  did not write itself, the database tests refuse to run rather than risk an
+  installation. Data in other databases of the same Redis is never touched, but
+  since Redis pub/sub is server-wide a live ioBroker on the same server may
+  briefly see events for the `pytest*` namespaces while the suite runs.
+- **`builtin`** — the databases built into js-controller (the jsonl flavour a
+  default installation uses), started as a private Node.js process on fresh
+  ports with a temp data dir. Needs Node.js and a one-time install:
+
+  ```bash
+  cd tests/builtin && npm ci
+  ```
+
+A backend that is not available skips its half of the tests. CI sets
+`IOB_TEST_REQUIRE_REDIS=1` and `IOB_TEST_REQUIRE_BUILTIN=1`, which turn those
+skips into failures so a broken setup cannot pass as green. A handful of tests
+are gated to one backend — where an assertion needs a Redis command the built-in
+servers do not implement (`ttl`, `smembers`), or where the two deliberately
+differ (real Redis globs the whole file subtree, the built-in server answers one
+directory level).
 
 ## License
 

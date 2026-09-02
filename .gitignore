@@ -8,3 +8,7 @@ build/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# The built-in database servers are installed here for the tests; only the
+# manifest and lockfile are tracked.
+node_modules/

@@ -1,0 +1,111 @@
+name: Test
+
+# Lint plus the full test suite -- including the database tests -- on the same
+# OS matrix js-controller tests on. Every job runs against a real Redis;
+# IOB_TEST_REQUIRE_REDIS turns a missing server into a failure, so a broken
+# Redis setup can never pass as "everything skipped, therefore green".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check .
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    env:
+      IOB_TEST_REQUIRE_REDIS: "1"
+      IOB_TEST_REQUIRE_BUILTIN: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      # The built-in-database backend runs the js-controller jsonl servers as a
+      # Node process, so both runtimes are needed on every matrix leg.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the built-in database servers
+        working-directory: tests/builtin
+        run: npm ci
+
+      - name: Install Redis (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y redis-server
+          for _ in $(seq 1 30); do
+            if redis-cli ping 2>/dev/null | grep -q PONG; then
+              echo "Redis is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Redis did not answer PING within 30s"
+          exit 1
+
+      - name: Install Redis (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install redis
+          # `brew services start` only registers a launchd job and returns before
+          # the server listens; start it directly and wait (same lesson as in the
+          # js-controller CI).
+          redis-server --daemonize yes --logfile "$RUNNER_TEMP/redis.log"
+          for _ in $(seq 1 30); do
+            if redis-cli ping 2>/dev/null | grep -q PONG; then
+              echo "Redis is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Redis did not answer PING within 30s"
+          cat "$RUNNER_TEMP/redis.log" || true
+          exit 1
+
+      - name: Install Redis (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Redis-x64-5.0.14.1.zip" -OutFile "$env:RUNNER_TEMP\redis.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\redis.zip" -DestinationPath "$env:RUNNER_TEMP\redis"
+          Start-Process -FilePath "$env:RUNNER_TEMP\redis\redis-server.exe"
+          $cli = "$env:RUNNER_TEMP\redis\redis-cli.exe"
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              if ((& $cli ping) -eq "PONG") { Write-Output "Redis is up"; exit 0 }
+            } catch {}
+            Start-Sleep 1
+          }
+          Write-Error "Redis did not answer PING within 30s"
+          exit 1
+
+      - name: Install package
+        run: pip install -e .[dev]
+
+      - name: Run tests
+        run: pytest -v

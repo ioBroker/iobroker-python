@@ -1,0 +1,6 @@
+{
+    "name": "iobroker.js-controller",
+    "version": "0.0.0-stub",
+    "private": true,
+    "description": "Satisfies getControllerDir() of @iobroker/js-controller-common-db without installing the real controller (whose install scripts set up a whole installation). The database servers only need the directory to exist."
+}

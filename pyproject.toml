@@ -44,7 +44,21 @@ packages = ["src/iobroker"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # redis-py deprecations about its own API surface. The SDK's usage is deliberate:
+    # setex is what the built-in server understands (SET with EX is not guaranteed),
+    # and lib_name/lib_version=None is what suppresses CLIENT SETINFO.
+    "ignore:Call to deprecated setex:DeprecationWarning",
+    "ignore:Call to '__init__' function with deprecated usage:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+# CI installs the newest ruff, and its default rule set grows over time -- an
+# explicit selection keeps that from turning the build red without a code
+# change. This is ruff's classic default.
+select = ["E4", "E7", "E9", "F"]
