@@ -747,12 +747,23 @@ class Adapter:
         # Whatever is left is a state id: the prefix was already removed above.
         state_id = channel
 
-        # Controller stop signal: sigKill == -1 means "terminate yourself".
+        # Controller stop signal. -1 means "terminate yourself"; any other value
+        # is the PID of the process the controller believes it is supervising.
+        # When that is not us, another supervisor took over (the instance was
+        # started twice) and the stale process -- us -- must go, exactly like
+        # adapter-core behaves. Only our own PID means "keep running".
         if state_id == f"{self.instance_id}.sigKill":
             if data and data != "null":
                 with contextlib.suppress(Exception):
-                    if int(json.loads(data).get("val", 0)) == -1:
+                    val = int(json.loads(data).get("val", 0))
+                    if val == -1:
                         self.log.info("sigKill received -- shutting down")
+                        self._stopping.set()
+                    elif val != os.getpid():
+                        self.log.warn(
+                            f"sigKill carries PID {val}, ours is {os.getpid()} -- "
+                            "another process supervises this instance now, shutting down"
+                        )
                         self._stopping.set()
             return
 
