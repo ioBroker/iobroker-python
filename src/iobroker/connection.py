@@ -94,16 +94,18 @@ def _lower_cmd(args: tuple) -> tuple:
 
 
 class _LowercasePacker:
-    """Wraps the command packer of the synchronous redis-py connection."""
+    """Wraps the command packer of the synchronous redis-py connection.
+
+    ``pack`` is the only hook needed: pipelines go through the connection's
+    ``pack_commands``, which feeds every command through ``pack`` -- the packer
+    itself has no ``pack_commands``.
+    """
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
 
     def pack(self, *args: Any):
         return self._inner.pack(*_lower_cmd(args))
-
-    def pack_commands(self, commands: Iterable[tuple]):
-        return self._inner.pack_commands([_lower_cmd(c) for c in commands])
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
