@@ -188,6 +188,12 @@ no `SIGTERM`. Any other value is the PID the controller believes it supervises:
 when that is not the adapter's own PID, another supervisor has taken over and
 the stale process shuts down as well — the behaviour of `adapter-core`.
 
+A database that goes away does **not** end the adapter: both pumps notice the
+dead connection, back off (1 s, doubling to at most 30 s) and reopen their
+subscriptions with the patterns registered before the outage, so events resume
+by themselves once the database is back. `test_reconnect.py` proves it by
+running the adapter through a TCP relay it cuts and mends again.
+
 The process ends with the exit code the controller keys its restart behaviour
 off (the `ExitCode` enum, mirroring `@iobroker/js-controller-common-db`).
 `run()` returns `0` on a clean stop, exits `6` (`UNCAUGHT_EXCEPTION`) on an
