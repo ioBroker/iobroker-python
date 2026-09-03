@@ -188,6 +188,14 @@ no `SIGTERM`. Any other value is the PID the controller believes it supervises:
 when that is not the adapter's own PID, another supervisor has taken over and
 the stale process shuts down as well — the behaviour of `adapter-core`.
 
+The process ends with the exit code the controller keys its restart behaviour
+off (the `ExitCode` enum, mirroring `@iobroker/js-controller-common-db`).
+`run()` returns `0` on a clean stop, exits `6` (`UNCAUGHT_EXCEPTION`) on an
+exception the adapter never handled — restarted and counted towards restart-loop
+detection — and exits with whatever `terminate()` was given. Call
+`adapter.terminate("done")` for a planned stop the controller does **not**
+restart (`11`); a `once` or `schedule` adapter uses it when its work is finished.
+
 ## Development
 
 ```bash

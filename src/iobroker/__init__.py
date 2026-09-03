@@ -13,6 +13,7 @@ from .connection import (
     load_db_config,
 )
 from .crypto import decrypt
+from .exit_codes import ExitCode
 from .files import FileMeta
 from .types import Message, State, now_ms
 
@@ -30,6 +31,7 @@ __all__ = [
     "load_db_config",
     "now_ms",
     "decrypt",
+    "ExitCode",
     "FileMeta",
     "__version__",
 ]

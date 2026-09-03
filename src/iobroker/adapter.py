@@ -28,6 +28,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from typing import Any
 
 from .connection import (
@@ -51,6 +52,7 @@ from .files import (
     split_file_key,
 )
 from .crypto import decrypt, decrypt_native
+from .exit_codes import ExitCode
 from .types import Message, State, now_ms
 
 __all__ = ["Adapter"]
@@ -77,6 +79,7 @@ class Adapter:
         self._alive: asyncio.Task | None = None
         self._stopping = asyncio.Event()
         self._started = time.time()
+        self._exit_code = int(ExitCode.NO_ERROR)
         self._loglevel = os.environ.get("IOB_LOGLEVEL") or _read_loglevel()
 
         self._builtin_states = True
@@ -118,11 +121,24 @@ class Adapter:
     # -- Startup ----------------------------------------------------------
 
     def run(self) -> None:
-        """Start the adapter and block until it stops."""
+        """Start the adapter and block until it stops, then exit with the code the controller
+        understands (see ``doc/PYTHON.md``): ``0`` on a clean stop, ``11`` when the adapter asked
+        to terminate, ``6`` on an exception it did not handle.
+        """
         try:
             asyncio.run(self._main())
         except KeyboardInterrupt:
-            pass
+            # Ctrl-C / SIGINT is a graceful stop, same as the controller's sigKill -1.
+            return
+        except Exception:
+            # The controller restarts on this and counts it towards restart-loop detection. The
+            # traceback goes to stderr, which the controller forwards to its log at error level --
+            # writing it through the (now torn-down) states connection is no longer possible here.
+            traceback.print_exc()
+            sys.exit(int(ExitCode.UNCAUGHT_EXCEPTION))
+
+        if self._exit_code:
+            sys.exit(self._exit_code)
 
     async def _main(self) -> None:
         states_cfg = load_db_config("states")
@@ -866,7 +882,25 @@ class Adapter:
                 loop.add_signal_handler(sig, self._stopping.set)
 
     def stop(self) -> None:
-        """Shut the adapter down in an orderly fashion."""
+        """Shut the adapter down in an orderly fashion (exit code 0)."""
+        self._stopping.set()
+
+    def terminate(
+        self, reason: str | None = None, exit_code: int = int(ExitCode.ADAPTER_REQUESTED_TERMINATION)
+    ) -> None:
+        """Ask the controller to stop this instance and **not** restart it.
+
+        Sets the process exit code (``11`` -- "planned stop" -- by default) and starts an orderly
+        shutdown, the same way ``adapter.terminate()`` does in the Node.js framework. Use it for an
+        adapter that has finished its work (``once``/``schedule``) or that detected a condition
+        under which it must not keep running.
+
+        :param reason: logged as the reason for the stop
+        :param exit_code: the code to exit with; ``START_IMMEDIATELY_AFTER_STOP`` (156) asks for a
+            restart after 1 s instead
+        """
+        self.log.info(f"Terminating: {reason}" if reason else "Terminating")
+        self._exit_code = int(exit_code)
         self._stopping.set()
 
     async def _shutdown(self) -> None:
