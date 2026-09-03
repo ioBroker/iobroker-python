@@ -233,6 +233,16 @@ servers do not implement (`ttl`, `smembers`), or where the two deliberately
 differ (real Redis globs the whole file subtree, the built-in server answers one
 directory level).
 
+`test_interop.py` goes one step further and proves **cross-language
+conformance**: a state or object written by the real js-controller client
+(`@iobroker/db-states-redis` / `@iobroker/db-objects-redis`, driven through
+`tests/builtin/interop.mjs`) is read field-for-field identically by the SDK, and
+the reverse. The two-backend tests show the SDK works against the real database
+*servers*; this shows the wire *envelope* the SDK writes and parses is the one a
+Node.js adapter writes and parses — so a Python and a Node.js adapter sharing a
+state actually agree on it. It runs on the built-in backend only (the envelope
+comes from the JS client and is the same whatever server stores it).
+
 ## License
 
 MIT
