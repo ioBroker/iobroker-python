@@ -99,6 +99,14 @@ subscription on `system.config`, the way the JS client tracks it), while an
 untouched. Installations that never configured a default get no invented `acl`,
 matching the JS client on such installs.
 
+`lc` ("last change") is computed the same way, and for the same reason — the
+database stores a blob, the client decides what goes in it. `set_state` moves
+`lc` only when the value actually changed and otherwise carries the previous one
+forward, so a sensor polled every 30 seconds with a steady reading does not look
+like it changes every 30 seconds. `True` and `1` count as different values, as
+they do for the JS client's `isDeepStrictEqual`. An `lc` you pass yourself always
+wins. Like the JS client, this costs one read before the write.
+
 ## Capability probe
 
 ```bash

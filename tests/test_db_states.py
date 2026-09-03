@@ -81,6 +81,107 @@ class TestSetAndGet:
         assert await raw.get("io.pytest.0.system.adapter.pytest.0.custom") is None
 
 
+class TestAwkwardIdsAndPayloads:
+    """ioBroker ids and values are UTF-8 and unbounded in practice; neither the lowercasing
+    command packer nor the built-in server may mangle them."""
+
+    async def test_unicode_in_an_id(self, adapter) -> None:
+        await adapter.set_state("küche.temperatur.温度", 21)
+
+        assert (await adapter.get_state("küche.temperatur.温度")).val == 21
+
+    async def test_unicode_in_a_value(self, adapter) -> None:
+        await adapter.set_state("greeting", "Grüße 温度 🌡")
+
+        assert (await adapter.get_state("greeting")).val == "Grüße 温度 🌡"
+
+    async def test_a_large_payload_survives(self, adapter) -> None:
+        # Big enough to cross the socket buffer, which is where a length-handling bug shows up.
+        payload = "x" * 100_000
+
+        await adapter.set_state("big", payload)
+
+        assert (await adapter.get_state("big")).val == payload
+
+    async def test_a_deeply_nested_id(self, adapter) -> None:
+        deep = ".".join(f"level{i}" for i in range(12))
+
+        await adapter.set_state(deep, "bottom")
+
+        assert (await adapter.get_state(deep)).val == "bottom"
+
+
+class TestLastChange:
+    """``lc`` is what separates "the reading is new" from "the reading was refreshed".
+
+    The JS client only moves it when the value actually changed; a sensor polled every 30 seconds
+    with a steady reading must not look like it changes every 30 seconds.
+    """
+
+    async def test_the_first_write_sets_lc_to_ts(self, adapter, raw) -> None:
+        await adapter.set_state("lc.fresh", 5, ack=True)
+
+        stored = await read_state(raw, "pytest.0.lc.fresh")
+        assert stored["lc"] == stored["ts"]
+
+    async def test_an_unchanged_value_keeps_lc(self, adapter, raw) -> None:
+        await adapter.set_state("lc.steady", 5, ack=True)
+        first = await read_state(raw, "pytest.0.lc.steady")
+        await asyncio.sleep(0.01)
+
+        await adapter.set_state("lc.steady", 5, ack=True)
+
+        second = await read_state(raw, "pytest.0.lc.steady")
+        assert second["lc"] == first["lc"], "lc moved although the value did not change"
+        assert second["ts"] > first["ts"], "ts must still move on every write"
+
+    async def test_a_changed_value_moves_lc(self, adapter, raw) -> None:
+        await adapter.set_state("lc.moving", 5, ack=True)
+        first = await read_state(raw, "pytest.0.lc.moving")
+        await asyncio.sleep(0.01)
+
+        await adapter.set_state("lc.moving", 6, ack=True)
+
+        second = await read_state(raw, "pytest.0.lc.moving")
+        assert second["lc"] > first["lc"]
+        assert second["lc"] == second["ts"]
+
+    async def test_an_explicit_lc_is_kept(self, adapter, raw) -> None:
+        # A caller that knows when the value changed (replaying history, say) must win.
+        await adapter.set_foreign_state("pytest.0.lc.pinned", State(val=1, ack=True, lc=12345))
+
+        assert (await read_state(raw, "pytest.0.lc.pinned"))["lc"] == 12345
+
+    async def test_true_and_one_count_as_a_change(self, adapter, raw) -> None:
+        # Python's == treats True and 1 as equal, the JS client's isDeepStrictEqual does not.
+        # A switch flipping between them must not silently stop moving lc.
+        await adapter.set_state("lc.switch", 1, ack=True)
+        first = await read_state(raw, "pytest.0.lc.switch")
+        await asyncio.sleep(0.01)
+
+        await adapter.set_state("lc.switch", True, ack=True)
+
+        second = await read_state(raw, "pytest.0.lc.switch")
+        assert second["lc"] > first["lc"]
+
+    async def test_a_reused_state_object_is_not_pinned(self, adapter, raw) -> None:
+        # The computed lc must never be written back onto the caller's State: reusing one object
+        # for repeated writes would otherwise carry the first lc forward for good.
+        reused = State(val=7, ack=True)
+        await adapter.set_foreign_state("pytest.0.lc.reused", reused)
+        await asyncio.sleep(0.01)
+        await adapter.set_foreign_state("pytest.0.lc.reused", reused)
+        await asyncio.sleep(0.01)
+
+        assert reused.lc is None
+        reused.val = 8
+        await adapter.set_foreign_state("pytest.0.lc.reused", reused)
+
+        stored = await read_state(raw, "pytest.0.lc.reused")
+        assert stored["val"] == 8
+        assert stored["lc"] == stored["ts"], "a real change must move lc even on a reused object"
+
+
 class TestPublish:
     async def test_set_state_publishes_what_it_stores(self, adapter, raw) -> None:
         """Write and publish happen in one MULTI; subscribers must see the exact payload.

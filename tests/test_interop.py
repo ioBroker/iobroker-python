@@ -143,6 +143,46 @@ class TestPythonWritesJsReads:
         assert obj["from"] == "system.adapter.pytest.0"
 
 
+class TestLastChangeConformance:
+    """The ``lc`` rule is the JS client's, measured against the JS client itself."""
+
+    async def test_both_sides_keep_lc_on_an_unchanged_write(self, adapter, db) -> None:
+        only_builtin(db, "drives the real JS client against the built-in server")
+
+        # The reference: the JS client writing the same value twice does not move lc.
+        await run_js(db, "set-state", "jsside.0.lc", {"val": 5, "ack": True})
+        js_first = (await run_js(db, "get-state", "jsside.0.lc"))["state"]
+        await run_js(db, "set-state", "jsside.0.lc", {"val": 5, "ack": True})
+        js_second = (await run_js(db, "get-state", "jsside.0.lc"))["state"]
+
+        assert js_second["lc"] == js_first["lc"]
+        assert js_second["ts"] > js_first["ts"]  # ts still moves
+
+        # The SDK must behave identically.
+        await adapter.set_foreign_state("pyside.0.lc", State(val=5, ack=True))
+        py_first = await adapter.get_foreign_state("pyside.0.lc")
+        await asyncio.sleep(0.01)
+        await adapter.set_foreign_state("pyside.0.lc", State(val=5, ack=True))
+        py_second = await adapter.get_foreign_state("pyside.0.lc")
+
+        assert py_second.lc == py_first.lc
+        assert py_second.ts > py_first.ts
+
+    async def test_a_python_write_continues_a_js_history(self, adapter, db) -> None:
+        # The sharpest form: the SDK writing the same value on top of a JS-written state must keep
+        # the lc the JS client established, not restart it.
+        only_builtin(db, "drives the real JS client against the built-in server")
+
+        await run_js(db, "set-state", "shared.0.lc", {"val": 9, "ack": True})
+        js_state = (await run_js(db, "get-state", "shared.0.lc"))["state"]
+        await asyncio.sleep(0.01)
+
+        await adapter.set_foreign_state("shared.0.lc", State(val=9, ack=True))
+
+        after = await adapter.get_foreign_state("shared.0.lc")
+        assert after.lc == js_state["lc"], "the SDK restarted a last-change the JS client owned"
+
+
 class TestValueFidelity:
     """Values of every JSON kind survive the crossing in both directions unchanged."""
 

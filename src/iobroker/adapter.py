@@ -277,11 +277,32 @@ class Adapter:
 
         Writing and publishing go into a single MULTI -- the JS client does the
         same, and setState is the hottest path in the system.
+
+        ``lc`` ("last change") only moves when the value actually changed; an unchanged write keeps
+        the previous one. That distinction is what tells an adapter or a script that a reading is
+        new rather than merely refreshed, so a sensor polled every 30 seconds does not look like it
+        changes every 30 seconds. Reading the previous state for it is what the JS client does too,
+        so the extra round-trip is part of the contract rather than an addition.
         """
         state = val if isinstance(val, State) else State(val=val, ack=ack)
         state.from_ = state.from_ or self.instance_id
-        payload = json.dumps(state.to_wire())
         key = f"{STATES_PREFIX}{id}"
+
+        wire = state.to_wire()
+
+        # Only when the caller did not pin lc itself. The result goes into `wire`, never back onto
+        # `state`: a caller reusing one State object for repeated writes would otherwise carry a
+        # pinned lc forward for good.
+        if state.lc is None:
+            previous = None
+            with contextlib.suppress(Exception):
+                raw = await self._states.get(key)
+                if raw:
+                    previous = json.loads(raw)
+            if previous and previous.get("lc") and _same_value(previous.get("val"), state.val):
+                wire["lc"] = previous["lc"]
+
+        payload = json.dumps(wire)
 
         pipe = self._states.pipeline(transaction=True)
         if expire:
@@ -980,6 +1001,18 @@ class _Log:
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+def _same_value(previous: Any, current: Any) -> bool:
+    """Whether two state values count as unchanged, the way the JS client compares them.
+
+    ``isDeepStrictEqual`` in the JS client keeps ``True`` and ``1`` apart, while Python's ``==``
+    considers them equal -- and a switch flipping between ``1`` and ``True`` is exactly the case
+    that would otherwise silently stop moving ``lc``.
+    """
+    if isinstance(previous, bool) != isinstance(current, bool):
+        return False
+    return previous == current
+
 
 def _cli() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
