@@ -81,6 +81,11 @@ class Adapter:
 
         self._builtin_states = True
         self._secret: str | None = None
+        # The installation's default ACL, applied to objects created without one -- exactly what the
+        # JS objects client does. Loaded at startup and kept current through the system.config
+        # subscription below. ``None`` means "not configured" (older installs); then nothing is
+        # stamped, matching JS.
+        self._default_new_acl: dict[str, Any] | None = None
 
         # Kept so subscriptions can be restored after a reconnect. redis-py restores its own
         # record, but the built-in server echoes patterns back in a different form than it was
@@ -131,11 +136,17 @@ class Adapter:
         await check_protocol(self._objects, "objects")
 
         await self._load_config()
+        await self._load_default_acl()
         self._install_signal_handlers()
 
         # Our own messagebox and the controller's stop signal.
         self._state_patterns.add(f"{MESSAGE_PREFIX}{self.instance_id}")
         self._state_patterns.add(f"{STATES_PREFIX}{self.instance_id}.sigKill")
+
+        # Watch system.config so a change to defaultNewAcl made in admin takes effect without a
+        # restart -- the JS objects client subscribes to the very same object for the very same
+        # reason.
+        self._object_patterns.add(f"{OBJECTS_PREFIX}system.config")
 
         self._sub = await self._open_subscription(self._states, self._state_patterns)
         self._pump = asyncio.create_task(self._run_pump("states"))
@@ -205,6 +216,29 @@ class Adapter:
             return None
 
         return decrypt(await self.get_system_secret(), value)
+
+    async def _load_default_acl(self) -> None:
+        """Read ``system.config.common.defaultNewAcl`` once at startup.
+
+        An installation that has never configured it leaves ``self._default_new_acl`` at ``None``,
+        and then no acl is stamped -- the same behaviour the JS client shows on such installs.
+        """
+        obj = await self.get_foreign_object("system.config")
+        acl = ((obj or {}).get("common") or {}).get("defaultNewAcl")
+        if acl:
+            self._default_new_acl = acl
+
+    def _default_acl_for(self, obj_type: str | None) -> dict[str, Any]:
+        """The acl to stamp on a new object of ``obj_type`` from ``defaultNewAcl``.
+
+        Mirrors the JS objects client: ``file`` is dropped (it is the default for files, not for
+        the object itself) and ``state`` is kept only for states.
+        """
+        acl = dict(self._default_new_acl or {})
+        acl.pop("file", None)
+        if obj_type != "state":
+            acl.pop("state", None)
+        return acl
 
     # -- States -----------------------------------------------------------
 
@@ -306,8 +340,22 @@ class Adapter:
         obj.setdefault("native", {})
         obj["from"] = self.instance_id
         obj["ts"] = now_ms()
-        payload = json.dumps(obj)
         key = f"{OBJECTS_PREFIX}{id}"
+
+        # ACL: a new object that carries no acl of its own inherits the installation's default,
+        # just like the JS objects client does. An acl already present on the incoming object, or
+        # on the object being overwritten, is left untouched -- overwriting must not silently reset
+        # rights a user changed. The extra read happens only when there is a default to apply and
+        # the caller supplied no acl, so the common create-with-acl path stays a single write.
+        if self._default_new_acl and not obj.get("acl"):
+            old_acl = None
+            existing = await self._objects.get(key)
+            if existing:
+                with contextlib.suppress(Exception):
+                    old_acl = json.loads(existing).get("acl")
+            obj["acl"] = old_acl or self._default_acl_for(obj.get("type"))
+
+        payload = json.dumps(obj)
 
         await self._objects.set(key, payload)
         await self._objects.publish(key, payload)
@@ -715,6 +763,12 @@ class Adapter:
         if channel.startswith(OBJECTS_PREFIX):
             obj_id = channel[len(OBJECTS_PREFIX) :]
             obj = None if not data or data == "null" else json.loads(data)
+            # Keep the cached default ACL current: a change made in admin must reach new objects
+            # without a restart, exactly as the JS client keeps it in step.
+            if obj_id == "system.config":
+                acl = ((obj or {}).get("common") or {}).get("defaultNewAcl")
+                if acl:
+                    self._default_new_acl = acl
             await self.on_object_change(obj_id, obj)
             return
 

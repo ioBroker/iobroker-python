@@ -89,6 +89,16 @@ hand over exactly what the flag exists to keep back. `get_foreign_object` and
 `@iobroker/adapter-core` uses — an adapter still sees its own settings, and
 `admin`, `iot`, `cloud` and `discovery` stay exempt.
 
+The other side of that coin is **stamping new objects with the default ACL**.
+`system.config.common.defaultNewAcl` defines owner, group and permission bits
+for freshly created objects; the JS objects client applies it, so an object
+created without an `acl` still carries one. The SDK does the same: a new object
+with no `acl` of its own inherits the default (kept current through a
+subscription on `system.config`, the way the JS client tracks it), while an
+`acl` you supply — or one already on the object being overwritten — is left
+untouched. Installations that never configured a default get no invented `acl`,
+matching the JS client on such installs.
+
 ## Capability probe
 
 ```bash
