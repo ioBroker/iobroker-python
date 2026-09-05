@@ -61,13 +61,30 @@ _BINARY_TYPES = {
 
 @dataclass
 class FileMeta:
-    """What the object database records about a stored file."""
+    """What the object database records about a stored file.
 
+    The ``$%$meta`` half of a file. It is what :meth:`~iobroker.Adapter.read_file_meta` returns,
+    and reading it is cheap where reading the file itself is not -- which makes it the right way to
+    ask how big a file is or whether it has moved.
+
+    The field names are snake_case here and camelCase on the wire; :meth:`to_wire` and
+    :meth:`from_wire` are where the two meet.
+    """
+
+    #: Length of the content in bytes. Stored nested as ``stats.size``, which is where the JS
+    #: client puts it.
     size: int = 0
+    #: The media type admin serves the file with. Derived from the extension when it was written.
     mime_type: str = "application/octet-stream"
+    #: Whether the content is binary. Follows from the media type and decides whether anything
+    #: reading the file may treat it as text.
     binary: bool = True
+    #: When the file was first written, in milliseconds. Preserved across overwrites: a rewritten
+    #: file is the same file.
     created_at: int | None = None
+    #: When it was last written, in milliseconds.
     modified_at: int | None = None
+    #: Owner, group and permissions. ``None`` means the default in :meth:`to_wire` applies.
     acl: dict[str, Any] | None = None
 
     def to_wire(self) -> dict[str, Any]:
@@ -94,6 +111,13 @@ class FileMeta:
 
     @classmethod
     def from_wire(cls, raw: dict[str, Any]) -> "FileMeta":
+        """Read the metadata back, tolerating what older writers left out.
+
+        Every field has a fallback, because these records were written by many versions over many
+        years and a file whose meta is missing ``binary`` still has to be listable.
+
+        :param raw: the decoded JSON from the ``$%$meta`` key
+        """
         return cls(
             size=int((raw.get("stats") or {}).get("size") or 0),
             mime_type=raw.get("mimeType") or "application/octet-stream",
