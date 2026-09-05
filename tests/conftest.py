@@ -126,14 +126,14 @@ class Backend:
 
 @pytest.fixture(scope="session")
 def _redis_backend() -> Backend:
-    probe = redis_sync.Redis(
-        host=TEST_HOST,
-        port=TEST_PORT,
-        db=TEST_DB,
-        decode_responses=True,
-        socket_connect_timeout=2,
-        socket_timeout=10,
-    )
+    cfg = DbConfig(host=TEST_HOST, port=TEST_PORT, db=TEST_DB, password=None, kind="redis")
+
+    # Probe through the SDK's own client, not a bare redis-py one. redis-py opens with a RESP3
+    # handshake, and `HELLO` only exists from Redis 6 -- against an older server every test then
+    # failed with "unknown command HELLO" and looked like "no Redis here". The SDK pins RESP2
+    # for exactly that reason, so using its connection is both the fix and the honest test: what
+    # the suite checks for is a server the SDK can talk to.
+    probe = connect(cfg)
     try:
         probe.ping()
     except Exception as exc:  # noqa: BLE001
@@ -152,7 +152,6 @@ def _redis_backend() -> Backend:
             "IOB_TEST_REQUIRE_REDIS",
         )
 
-    cfg = DbConfig(host=TEST_HOST, port=TEST_PORT, db=TEST_DB, password=None, kind="redis")
     backend = Backend("redis", cfg, cfg)
     yield backend
     with contextlib.suppress(Exception):
