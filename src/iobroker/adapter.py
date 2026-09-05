@@ -59,6 +59,12 @@ __all__ = ["Adapter"]
 
 _LEVELS = {"silly": 10, "debug": 10, "info": 20, "warn": 30, "error": 40}
 
+#: How long the states the heartbeat refreshes stay valid, in seconds.
+#: adapter-core uses ``statisticsInterval / 1000 + 10``, and that interval defaults to 15 s --
+#: the same 15 s this SDK's heartbeat runs at. The expiry is what makes a process that was
+#: killed outright stop claiming to be alive, instead of leaving the state true forever.
+_STATUS_EXPIRE_SECONDS = 25
+
 
 class Adapter:
     """Base class for a Python adapter."""
@@ -83,6 +89,11 @@ class Adapter:
         self._loglevel = os.environ.get("IOB_LOGLEVEL") or _read_loglevel()
 
         self._builtin_states = True
+        #: Whether the link to the databases is up. Reported as
+        #: ``system.adapter.<ns>.connected``, which is a different thing from the adapter's own
+        #: ``info.connection`` -- that one says whether it reached the device or service it
+        #: talks to, this one whether ioBroker can reach the adapter at all.
+        self.connected = False
         self._secret: str | None = None
         # The installation's default ACL, applied to objects created without one -- exactly what the
         # JS objects client does. Loaded at startup and kept current through the system.config
@@ -172,6 +183,7 @@ class Adapter:
 
         await self.set_state("info.connection", False, ack=True)
         await self._set_alive(True)
+        await self._set_connected(True)
         self._alive = asyncio.create_task(self._heartbeat())
 
         self.log.info(f"Adapter {self.namespace} started (PID {os.getpid()})")
@@ -904,16 +916,39 @@ class Adapter:
     # -- Heartbeat --------------------------------------------------------
 
     async def _set_alive(self, alive: bool) -> None:
-        await self.set_foreign_state(f"{self.instance_id}.alive", alive, ack=True)
+        # Only the "true" carries an expiry, exactly as adapter-core does it: an explicit false
+        # written on shutdown has to stay, while a true has to lapse if nothing refreshes it.
+        await self.set_foreign_state(
+            f"{self.instance_id}.alive",
+            alive,
+            ack=True,
+            expire=_STATUS_EXPIRE_SECONDS if alive else None,
+        )
+
+    async def _set_connected(self, connected: bool) -> None:
+        """Report the database link, the state admin shows next to an instance.
+
+        adapter-core writes this in the same status report as ``alive``; without it an instance
+        looks half-started in admin -- running, but never connected.
+        """
+        self.connected = connected
+        await self.set_foreign_state(
+            f"{self.instance_id}.connected",
+            connected,
+            ack=True,
+            expire=_STATUS_EXPIRE_SECONDS if connected else None,
+        )
 
     async def _heartbeat(self) -> None:
-        """Keep alive/uptime/memRss current -- just like a Node adapter does."""
+        """Keep alive/connected/uptime/memRss current -- just like a Node adapter does."""
         try:
             while not self._stopping.is_set():
                 await asyncio.sleep(15)
                 if self._stopping.is_set():
                     break
                 await self._set_alive(True)
+                if self.connected:
+                    await self._set_connected(True)
                 await self.set_foreign_state(
                     f"{self.instance_id}.uptime", int(time.time() - self._started), ack=True
                 )
@@ -971,6 +1006,8 @@ class Adapter:
             await self.set_state("info.connection", False, ack=True)
         with contextlib.suppress(Exception):
             await self._set_alive(False)
+        with contextlib.suppress(Exception):
+            await self._set_connected(False)
         for closable in (self._sub, self._osub, self._states, self._objects, self._files):
             if closable is not None:
                 with contextlib.suppress(Exception):
