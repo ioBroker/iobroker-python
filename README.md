@@ -8,6 +8,9 @@ alongside any Node adapter, with no bridge in between.
 > installation (js-controller 7.2.3, `jsonl` databases). The API may still
 > change.
 
+**[API reference](docs/API.md)** — every public class, method and function, with
+its parameters. This page is the guide; that one is the lookup.
+
 ## Installation
 
 ```bash

@@ -83,18 +83,14 @@ class Adapter:
 
     **What an instance carries**
 
-    :attr:`config`
-        the instance's ``native`` section, with everything listed in ``common.encryptedNative``
-        already decrypted -- an adapter reads a password the way it reads a hostname.
-    :attr:`log`
-        ``silly`` / ``debug`` / ``info`` / ``warn`` / ``error``. Goes to stdout *and* to the
-        ``log.`` channel, so both the controller and any log transporter see it.
-    :attr:`namespace`
-        ``<name>.<instance>`` -- the prefix of everything this adapter owns.
-    :attr:`instance_id`
-        ``system.adapter.<namespace>`` -- the id of the instance object itself.
-    :attr:`connected`
-        whether the link to the databases is up.
+    * ``config`` -- the instance's ``native`` section, with everything listed in
+      ``common.encryptedNative`` already decrypted; an adapter reads a password the way it reads
+      a hostname.
+    * ``log`` -- ``silly`` / ``debug`` / ``info`` / ``warn`` / ``error``. Goes to stdout *and* to
+      the ``log.`` channel, so both the controller and any log transporter see it.
+    * ``namespace`` -- ``<name>.<instance>``, the prefix of everything this adapter owns.
+    * ``instance_id`` -- ``system.adapter.<namespace>``, the id of the instance object itself.
+    * ``connected`` -- whether the link to the databases is up.
 
     **Own ids versus foreign ones**
 

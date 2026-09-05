@@ -26,6 +26,12 @@ jobs:
       - run: pip install ruff
       - run: ruff check .
 
+      # docs/API.md is generated from the docstrings. Checking it here is what keeps
+      # the two from drifting: a docstring edited without regenerating fails the build
+      # instead of quietly leaving the reference wrong.
+      - run: pip install -e .
+      - run: python tools/gen_api.py --check
+
   test:
     strategy:
       fail-fast: false
