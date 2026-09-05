@@ -178,6 +178,8 @@ class Recorder(Adapter):
         self.state_events: asyncio.Queue = asyncio.Queue()
         self.object_events: asyncio.Queue = asyncio.Queue()
         self.messages: asyncio.Queue = asyncio.Queue()
+        self.file_events: asyncio.Queue = asyncio.Queue()
+        self.log_events: asyncio.Queue = asyncio.Queue()
         self.unloaded = False
 
     async def on_ready(self) -> None:
@@ -191,6 +193,12 @@ class Recorder(Adapter):
 
     async def on_message(self, msg: Any) -> None:
         await self.messages.put(msg)
+
+    async def on_file_change(self, id: str, name: str, size: Any) -> None:
+        await self.file_events.put((id, name, size))
+
+    async def on_log(self, entry: Any) -> None:
+        await self.log_events.put(entry)
 
     async def on_unload(self) -> None:
         self.unloaded = True

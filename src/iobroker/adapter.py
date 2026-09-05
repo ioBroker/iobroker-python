@@ -132,6 +132,24 @@ class Adapter:
     async def on_message(self, msg: Message) -> None:
         """A message arrived through the messagebox."""
 
+    async def on_file_change(self, id: str, name: str, size: int | None) -> None:
+        """A subscribed file changed. ``size`` is its new length; ``None`` means deleted.
+
+        ``id`` owns the file and ``name`` is the path within it -- the same split
+        :meth:`write_file` takes, not the ``id$%$name`` key the database stores it under.
+
+        The content is deliberately not carried: ioBroker publishes only the size, so a handler
+        that wants the file reads it with :meth:`read_file`. That keeps a large file out of every
+        subscriber's socket when most of them only need to know that it moved.
+        """
+
+    async def on_log(self, entry: dict[str, Any]) -> None:
+        """A log line from somewhere else in the system.
+
+        Only reaches an adapter that called :meth:`subscribe_logs`. In ioBroker this is what a log
+        transporter does -- an adapter that collects the log rather than writing to it.
+        """
+
     async def on_unload(self) -> None:
         """Last chance to clean up before the process ends."""
 
@@ -388,6 +406,61 @@ class Adapter:
     async def unsubscribe_foreign_objects(self, pattern: str) -> None:
         """Stop receiving object changes matching ``pattern``."""
         await self._unsubscribe(f"{OBJECTS_PREFIX}{pattern}", self._object_patterns, self._osub)
+
+    async def subscribe_files(self, pattern: str = "*") -> None:
+        """Watch files below our own namespace."""
+        await self.subscribe_foreign_files(self.namespace, pattern)
+
+    async def subscribe_foreign_files(self, id: str, pattern: str = "*") -> None:
+        """Watch files of ``id``, delivered to :meth:`on_file_change`.
+
+        ``id`` is the object that owns the files -- ``vis-2.0``, ``admin.admin`` -- and ``pattern``
+        matches the path inside it, so ``subscribe_foreign_files("vis-2.0", "main/*")``.
+
+        Files travel on the objects connection: they live in the objects database, keyed
+        ``cfg.f.<id>$%$<name>``. That is why this sits beside the object subscriptions rather than
+        the state ones.
+
+        The pattern carries the ``$%$data`` suffix, which is not decoration: it is what the JS
+        client subscribes with, and each backend needs it for a different reason. Real Redis
+        delivers on the data key itself, so without the suffix nothing matches at all; the built-in
+        server strips the suffix again before registering, so it accepts the same string. Leaving
+        it off is silent on both -- a subscription that exists and never fires.
+        """
+        full = f"{FILES_PREFIX}{id}{FILE_SEPARATOR}{pattern}{FILE_SEPARATOR}data"
+        self._object_patterns.add(full)
+        await self._osub.psubscribe(full)
+
+    async def unsubscribe_files(self, pattern: str = "*") -> None:
+        """Stop watching files below our own namespace."""
+        await self.unsubscribe_foreign_files(self.namespace, pattern)
+
+    async def unsubscribe_foreign_files(self, id: str, pattern: str = "*") -> None:
+        """Stop watching files of ``id`` matching ``pattern``."""
+        await self._unsubscribe(
+            f"{FILES_PREFIX}{id}{FILE_SEPARATOR}{pattern}{FILE_SEPARATOR}data",
+            self._object_patterns,
+            self._osub,
+        )
+
+    async def subscribe_logs(self, pattern: str = "*") -> None:
+        """Receive the log of other adapters, delivered to :meth:`on_log`.
+
+        What ioBroker calls a log transporter. The pattern names instances, so ``"*"`` is the whole
+        system and ``"system.adapter.hue.0"`` is one adapter.
+
+        A host only forwards its adapters' logs to the database once something has asked for them,
+        which an adapter announces with ``common.logTransporter`` in its io-package.json.
+        Subscribing without that setting is not an error -- the subscription simply stays quiet,
+        which is a confusing way to find out, so it is worth saying here.
+        """
+        full = f"{LOG_PREFIX}{pattern}"
+        self._state_patterns.add(full)
+        await self._sub.psubscribe(full)
+
+    async def unsubscribe_logs(self, pattern: str = "*") -> None:
+        """Stop receiving other adapters' log."""
+        await self._unsubscribe(f"{LOG_PREFIX}{pattern}", self._state_patterns, self._sub)
 
     async def _unsubscribe(self, full: str, patterns: set[str], sub: Any) -> None:
         """Drop one recorded pattern and tell the server, if there is one yet.
@@ -724,7 +797,14 @@ class Adapter:
         :param id: owning id
         :param name: path within that id
         """
-        await self._file_client().delete(file_key(FILES_PREFIX, id, name, "data"))
+        data_key = file_key(FILES_PREFIX, id, name, "data")
+
+        await self._file_client().delete(data_key)
+        # Announce it, exactly as the JS client's `_delBinaryState` does. Without this a subscriber
+        # on real Redis never learns the file is gone: a DEL notifies nobody there. The built-in
+        # server does publish on the delete itself, which is what makes the omission invisible
+        # until an installation moves to Redis.
+        await self._file_client().publish(data_key, "null")
         await self._objects.delete(file_key(FILES_PREFIX, id, name, "meta"))
 
     async def read_dir(self, id: str, path: str = "") -> list[dict[str, Any]]:
@@ -899,6 +979,21 @@ class Adapter:
                 self.log.warn(f"Could not reopen the {kind} subscription: {exc}")
 
     async def _dispatch(self, channel: str, data: str) -> None:
+        # Files travel on the objects connection as well, under their own prefix. Checked before
+        # objects because `cfg.f.` and `cfg.o.` only differ in one character, and getting the order
+        # wrong would hand a file change to `on_object_change` as an object that will not parse.
+        if channel.startswith(FILES_PREFIX):
+            rest = channel[len(FILES_PREFIX) :]
+            owner, _, name = rest.partition(FILE_SEPARATOR)
+            # The server appends `$%$meta` or `$%$data` to say which half changed; a subscriber
+            # wants the file, not the storage detail.
+            for suffix in (f"{FILE_SEPARATOR}meta", f"{FILE_SEPARATOR}data"):
+                name = name.removesuffix(suffix)
+            # The payload is the new byte length, or "null" for a deletion -- not the content.
+            size = None if not data or data == "null" else json.loads(data)
+            await self.on_file_change(owner, name, size)
+            return
+
         # Object changes arrive on the objects connection and keep their prefix, unlike states.
         if channel.startswith(OBJECTS_PREFIX):
             obj_id = channel[len(OBJECTS_PREFIX) :]
@@ -923,6 +1018,13 @@ class Adapter:
         # and routes it into the state branch instead.
         if channel.startswith(STATES_PREFIX):
             channel = channel[len(STATES_PREFIX) :]
+
+        # Someone else's log line. Like the messagebox, this has to be tested after the "io."
+        # prefix has been stripped, because the two servers disagree about carrying it.
+        if channel.startswith(LOG_PREFIX):
+            with contextlib.suppress(json.JSONDecodeError):
+                await self.on_log(json.loads(data))
+            return
 
         # Messagebox
         if channel.startswith(MESSAGE_PREFIX):

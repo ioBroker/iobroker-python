@@ -15,6 +15,7 @@ import os
 from iobroker.crypto import decrypt
 from iobroker.types import now_ms
 from support import (
+    only_real_redis,
     delete_object,
     delete_state,
     drive,
@@ -219,6 +220,148 @@ class TestUnsubscribing:
         assert internal <= a._state_patterns | a._object_patterns, (
             "without its messagebox or sigKill the adapter answers nothing and cannot be stopped"
         )
+
+
+class TestFileSubscriptions:
+    """Files live in the objects database, so they arrive on the objects connection.
+
+    The pattern carries a ``$%$data`` suffix, which each backend needs for a different reason:
+    real Redis publishes on the data key itself, and the built-in server strips the suffix again
+    before registering. Leaving it off is silent on both -- which is why there is a test.
+    """
+
+    async def test_a_write_reaches_the_callback(self, run_adapter) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_foreign_files("pytest.0", "*")
+
+        id, name, size = await drive(
+            lambda: a.write_file("pytest.0", "icons/lamp.png", b"abc"),
+            a.file_events,
+            lambda e: e[1] == "icons/lamp.png",
+        )
+
+        assert id == "pytest.0", "the owner is separated from the path, not left as one key"
+        assert size == 3, "ioBroker publishes the new length, not the content"
+
+    async def test_a_deletion_arrives_as_none(self, run_adapter) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_foreign_files("pytest.0", "*")
+        await a.write_file("pytest.0", "doomed.txt", b"x")
+
+        _id, _name, size = await drive(
+            lambda: a.unlink("pytest.0", "doomed.txt"),
+            a.file_events,
+            lambda e: e[1] == "doomed.txt" and e[2] is None,
+        )
+
+        assert size is None
+
+    async def test_the_pattern_narrows(self, run_adapter) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_foreign_files("pytest.0", "icons/*")
+
+        await a.write_file("pytest.0", "elsewhere/other.txt", b"no")
+        await a.write_file("pytest.0", "icons/marker.png", b"yes")
+
+        await expect_only_marker(
+            a.file_events,
+            marker=lambda e: e[1] == "icons/marker.png",
+            forbidden=lambda e: e[1] == "elsewhere/other.txt",
+        )
+
+    async def test_unsubscribing_stops_it(self, run_adapter) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_foreign_files("pytest.0", "watched/*")
+        await a.subscribe_foreign_files("pytest.0", "marker/*")
+
+        await drive(
+            lambda: a.write_file("pytest.0", "watched/one.txt", b"1"),
+            a.file_events,
+            lambda e: e[1] == "watched/one.txt",
+        )
+
+        await a.unsubscribe_foreign_files("pytest.0", "watched/*")
+
+        await a.write_file("pytest.0", "watched/two.txt", b"2")
+        await a.write_file("pytest.0", "marker/ping.txt", b"3")
+
+        await expect_only_marker(
+            a.file_events,
+            marker=lambda e: e[1] == "marker/ping.txt",
+            forbidden=lambda e: e[1] == "watched/two.txt",
+        )
+
+    async def test_the_pattern_is_not_replayed_after_a_reconnect(self, run_adapter) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_foreign_files("pytest.0", "*")
+        assert any("pytest.0" in p for p in a._object_patterns if p.startswith("cfg.f."))
+
+        await a.unsubscribe_foreign_files("pytest.0", "*")
+
+        assert not [p for p in a._object_patterns if p.startswith("cfg.f.")]
+
+
+class TestLogSubscriptions:
+    """What ioBroker calls a log transporter: an adapter that collects the log."""
+
+    async def test_another_adapters_line_arrives(self, run_adapter, raw) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_logs("*")
+
+        entry = await drive(
+            lambda: raw.publish(
+                "log.system.adapter.hue.0",
+                json.dumps({"severity": "warn", "message": "lamp unreachable"}),
+            ),
+            a.log_events,
+            lambda e: e.get("message") == "lamp unreachable",
+        )
+
+        assert entry["severity"] == "warn"
+
+    async def test_unsubscribing_stops_it(self, run_adapter, raw) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_logs("system.adapter.hue.*")
+        await a.subscribe_logs("system.adapter.marker.*")
+
+        await drive(
+            lambda: raw.publish("log.system.adapter.hue.0", json.dumps({"message": "first"})),
+            a.log_events,
+            lambda e: e.get("message") == "first",
+        )
+
+        await a.unsubscribe_logs("system.adapter.hue.*")
+
+        await raw.publish("log.system.adapter.hue.0", json.dumps({"message": "gone"}))
+        await raw.publish("log.system.adapter.marker.0", json.dumps({"message": "marker"}))
+
+        await expect_only_marker(
+            a.log_events,
+            marker=lambda e: e.get("message") == "marker",
+            forbidden=lambda e: e.get("message") == "gone",
+        )
+
+    async def test_a_broken_payload_does_not_kill_the_pump(self, db, run_adapter, raw) -> None:
+        # A log line is written by somebody else; malformed JSON must cost that line and nothing
+        # more, or one bad producer takes the collecting adapter down with it.
+        #
+        # Only against real Redis, and not because the SDK differs: the built-in server parses the
+        # payload of a PUBLISH itself, unguarded, and drops the client connection when that throws
+        # (statesInMemServerRedis.ts, the `publish` handler). The line never reaches this SDK there,
+        # so there is nothing here to assert -- the robustness that is missing is js-controller's.
+        only_real_redis(db, "the built-in server drops the connection on a malformed PUBLISH")
+        a, _task = await run_adapter()
+        await a.subscribe_logs("*")
+
+        await raw.publish("log.system.adapter.hue.0", "{not json")
+
+        entry = await drive(
+            lambda: raw.publish("log.system.adapter.hue.0", json.dumps({"message": "after"})),
+            a.log_events,
+            lambda e: e.get("message") == "after",
+        )
+
+        assert entry["message"] == "after"
 
 
 class TestObjectSubscriptions:

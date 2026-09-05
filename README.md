@@ -181,6 +181,22 @@ The adapter's own patterns -- its messagebox, the controller's `sigKill`, `syste
 refused with a warning. An adapter that unsubscribed its `sigKill` would simply stop responding to
 `iobroker stop`, and nothing about that symptom points at the call that caused it.
 
+Files and logs have the same pair each:
+
+| | |
+|---|---|
+| `subscribe_foreign_files(id, pattern)` | files of `id`, delivered to `on_file_change(id, name, size)` |
+| `subscribe_logs(pattern)` | other adapters' log lines, delivered to `on_log(entry)` |
+
+`on_file_change` carries the new byte length, not the content -- that is what ioBroker publishes,
+and it keeps a large file out of every subscriber's socket. `None` means the file was deleted. Read
+the file with `read_file` when a handler actually needs it.
+
+`subscribe_logs` is what ioBroker calls a log transporter. A host only forwards its adapters' logs
+to the database once something has asked for them, which an adapter announces with
+`common.logTransporter` in its io-package.json. Subscribing without that setting is not an error --
+the subscription simply stays quiet.
+
 ## Files
 
 ioBroker keeps files in the objects database rather than on disk, which is what makes them survive
