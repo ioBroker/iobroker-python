@@ -87,6 +87,36 @@ async def read_state(client: Any, id: str) -> dict[str, Any] | None:
     return json.loads(raw) if raw else None
 
 
+async def expect_only_marker(
+    queue: asyncio.Queue,
+    marker: Callable[[Any], bool],
+    forbidden: Callable[[Any], bool],
+    timeout: float = 8.0,
+) -> None:
+    """Assert that ``forbidden`` never arrives, using ``marker`` as proof of delivery.
+
+    A plain "wait and see nothing" cannot tell an unsubscribed pattern from a slow one -- it passes
+    just as well when the whole pipeline is dead. So the caller publishes the forbidden event first
+    and the marker second: pub/sub keeps order on a connection, so by the time the marker has
+    arrived the forbidden one has had its chance and did not take it.
+    """
+    deadline = time.monotonic() + timeout
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError("the marker never arrived -- the subscription is not alive")
+        try:
+            item = await asyncio.wait_for(queue.get(), remaining)
+        except asyncio.TimeoutError:
+            raise AssertionError("the marker never arrived -- the subscription is not alive") from None
+
+        if forbidden(item):
+            raise AssertionError(f"an unsubscribed pattern still delivered {item!r}")
+        if marker(item):
+            return
+
+
 async def expect_event(
     queue: asyncio.Queue, pred: Callable[[Any], bool] | None = None, timeout: float = 8.0
 ) -> Any:

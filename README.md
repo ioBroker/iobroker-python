@@ -156,10 +156,30 @@ Beyond `get_object` / `set_object` / `set_object_not_exists`:
 | `get_adapter_objects()` | every object in the adapter's own namespace |
 | `get_object_view("system", type)` | objects of one type within an id range |
 | `subscribe_objects(pattern)` | notices configuration changes made while the adapter runs, delivered to `on_object_change` |
+| `unsubscribe_objects(pattern)` | takes that back; also `unsubscribe_states`, and the `_foreign_` form of both |
 
 `get_object_view` reads the type index sets rather than running Lua the way the JavaScript client
 does — the states database cannot run Lua at all and the objects database only sometimes can. Where
 the sets are switched off it falls back to scanning.
+
+## Subscriptions
+
+`subscribe_states(pattern)` and `subscribe_foreign_states(pattern)` deliver changes to
+`on_state_change`; the object pair does the same for `on_object_change`. Each has an
+`unsubscribe_` counterpart.
+
+A pattern is removed by its exact text, the way Redis itself works: unsubscribing `hue.0.*` leaves
+`hue.0.lamp.level` subscribed. Unsubscribing something that was never subscribed is not an error --
+a script engine tearing a script down should not have to know whether a neighbour still holds the
+same pattern.
+
+Two things happen on every unsubscribe, and both matter. The server is told, which stops the
+traffic now, and the pattern is dropped from the set this SDK keeps for reconnects. A pattern left
+in that set would come back the next time the database blinks.
+
+The adapter's own patterns -- its messagebox, the controller's `sigKill`, `system.config` -- are
+refused with a warning. An adapter that unsubscribed its `sigKill` would simply stop responding to
+`iobroker stop`, and nothing about that symptom points at the call that caused it.
 
 ## Files
 

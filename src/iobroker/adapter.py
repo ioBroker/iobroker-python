@@ -106,6 +106,12 @@ class Adapter:
         # given, so relying on that bookkeeping is not safe here.
         self._state_patterns: set[str] = set()
         self._object_patterns: set[str] = set()
+        # The patterns the adapter needs for itself: its messagebox, the controller's stop signal,
+        # ``system.config``. They live in the two sets above so a reconnect restores them, and are
+        # listed here so ``unsubscribe_*`` will not take them away -- an adapter that has
+        # unsubscribed its own sigKill can no longer be stopped, and nothing about that symptom
+        # would point back at the call that caused it.
+        self._internal_patterns: set[str] = set()
         self._osub: Any = None
         self._opump: asyncio.Task | None = None
         # Opened on first use: file content must not be decoded as text.
@@ -174,6 +180,8 @@ class Adapter:
         # restart -- the JS objects client subscribes to the very same object for the very same
         # reason.
         self._object_patterns.add(f"{OBJECTS_PREFIX}system.config")
+
+        self._internal_patterns = self._state_patterns | self._object_patterns
 
         self._sub = await self._open_subscription(self._states, self._state_patterns)
         self._pump = asyncio.create_task(self._run_pump("states"))
@@ -354,6 +362,55 @@ class Adapter:
         full = f"{OBJECTS_PREFIX}{pattern}"
         self._object_patterns.add(full)
         await self._osub.psubscribe(full)
+
+    async def unsubscribe_states(self, pattern: str = "*") -> None:
+        """Stop receiving changes of our own states."""
+        await self.unsubscribe_foreign_states(f"{self.namespace}.{pattern}")
+
+    async def unsubscribe_foreign_states(self, pattern: str) -> None:
+        """Stop receiving changes matching ``pattern``.
+
+        The pattern has to be the one that was subscribed, character for character: this removes a
+        subscription, it does not cancel every subscription a pattern would overlap. Unsubscribing
+        ``hue.0.*`` leaves ``hue.0.lamp.level`` in place, exactly as it does in the JS adapter and
+        in Redis itself.
+
+        Unknown patterns are ignored rather than reported. Removing a subscription that is not
+        there is what the caller wanted either way, and a script engine tearing down a script
+        should not have to know whether a neighbour still holds the same pattern.
+        """
+        await self._unsubscribe(f"{STATES_PREFIX}{pattern}", self._state_patterns, self._sub)
+
+    async def unsubscribe_objects(self, pattern: str = "*") -> None:
+        """Stop receiving changes of our own objects."""
+        await self.unsubscribe_foreign_objects(f"{self.namespace}.{pattern}")
+
+    async def unsubscribe_foreign_objects(self, pattern: str) -> None:
+        """Stop receiving object changes matching ``pattern``."""
+        await self._unsubscribe(f"{OBJECTS_PREFIX}{pattern}", self._object_patterns, self._osub)
+
+    async def _unsubscribe(self, full: str, patterns: set[str], sub: Any) -> None:
+        """Drop one recorded pattern and tell the server, if there is one yet.
+
+        Both halves matter. The set is what a reconnect replays, so a pattern left in it would come
+        back on the next outage; the server call is what stops the traffic now. Doing only one of
+        them is the kind of bug that shows up hours later as a handler firing for something the
+        script no longer watches.
+        """
+        if full in self._internal_patterns:
+            self.log.warn(f"refusing to unsubscribe {full!r}: the adapter needs it to work")
+            return
+
+        if full not in patterns:
+            return
+
+        patterns.discard(full)
+
+        # Before `run()` there is no connection, and after a reconnect the pattern is simply not
+        # replayed. Neither is an error -- the recorded set is the source of truth.
+        if sub is not None:
+            with contextlib.suppress(Exception):
+                await sub.punsubscribe(full)
 
     # -- Objects ----------------------------------------------------------
 

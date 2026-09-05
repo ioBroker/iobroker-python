@@ -19,6 +19,7 @@ from support import (
     delete_state,
     drive,
     expect_event,
+    expect_only_marker,
     expect_pmessage,
     read_state,
     wire_state,
@@ -113,6 +114,111 @@ class TestStateSubscriptions:
         )
 
         assert state.val == 1
+
+
+class TestUnsubscribing:
+    """Taking a subscription back -- both halves of it.
+
+    The server call is what stops the traffic now; removing the pattern from the recorded set is
+    what keeps it from coming back on the next reconnect, since that set is what gets replayed.
+    A test that only checked the first half would pass for hours and then fail after an outage.
+    """
+
+    async def test_a_state_pattern_stops_delivering(self, run_adapter, raw) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_foreign_states("pytestext.0.*")
+        await a.subscribe_foreign_states("pytestmark.0.*")
+
+        # Prove it was live before, or the test below proves nothing.
+        await drive(
+            lambda: write_state(raw, "pytestext.0.reading", wire_state(1)),
+            a.state_events,
+            lambda e: e[0] == "pytestext.0.reading",
+        )
+
+        await a.unsubscribe_foreign_states("pytestext.0.*")
+
+        await write_state(raw, "pytestext.0.reading", wire_state(2))
+        await write_state(raw, "pytestmark.0.ping", wire_state(1))
+
+        await expect_only_marker(
+            a.state_events,
+            marker=lambda e: e[0] == "pytestmark.0.ping",
+            forbidden=lambda e: e[0] == "pytestext.0.reading",
+        )
+
+    async def test_the_pattern_is_not_replayed_after_a_reconnect(self, run_adapter) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_foreign_states("pytestext.0.*")
+        assert "io.pytestext.0.*" in a._state_patterns
+
+        await a.unsubscribe_foreign_states("pytestext.0.*")
+
+        assert "io.pytestext.0.*" not in a._state_patterns, (
+            "a pattern left in the recorded set comes back on the next reconnect"
+        )
+
+    async def test_the_own_namespace_form(self, run_adapter) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_states("*")
+        assert f"io.{a.namespace}.*" in a._state_patterns
+
+        await a.unsubscribe_states("*")
+
+        assert f"io.{a.namespace}.*" not in a._state_patterns
+
+    async def test_an_object_pattern(self, run_adapter) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_foreign_objects("pytestext.0.*")
+        assert "cfg.o.pytestext.0.*" in a._object_patterns
+
+        await a.unsubscribe_foreign_objects("pytestext.0.*")
+
+        assert "cfg.o.pytestext.0.*" not in a._object_patterns
+
+    async def test_only_the_exact_pattern_goes(self, run_adapter) -> None:
+        # Removing a subscription, not cancelling everything it would overlap -- the same rule
+        # Redis itself follows, and the one the JS adapter follows.
+        a, _task = await run_adapter()
+        await a.subscribe_foreign_states("pytestext.0.*")
+        await a.subscribe_foreign_states("pytestext.0.reading")
+
+        await a.unsubscribe_foreign_states("pytestext.0.*")
+
+        assert "io.pytestext.0.reading" in a._state_patterns
+
+    async def test_an_unknown_pattern_is_ignored(self, run_adapter) -> None:
+        # A script engine tearing a script down should not have to know whether a neighbour still
+        # holds the same pattern.
+        a, _task = await run_adapter()
+        await a.unsubscribe_foreign_states("never.0.subscribed")
+
+    async def test_the_adapters_own_patterns_are_refused(self, run_adapter) -> None:
+        # sigKill is how the controller stops this process. An adapter that unsubscribed it would
+        # simply stop responding to `iobroker stop`, and nothing about that symptom points here.
+        a, _task = await run_adapter()
+        sig = f"io.{a.instance_id}.sigKill"
+        assert sig in a._state_patterns
+
+        await a.unsubscribe_foreign_states(f"{a.instance_id}.sigKill")
+
+        assert sig in a._state_patterns
+
+    async def test_every_internal_pattern_survives(self, run_adapter) -> None:
+        # Named individually rather than through a wildcard: `unsubscribe_foreign_states("*")`
+        # would not touch them anyway, because a pattern is removed by its exact text. The guard
+        # has to hold against someone naming one of them precisely.
+        a, _task = await run_adapter()
+        internal = set(a._internal_patterns)
+        assert internal, "the adapter records its own patterns at startup"
+
+        for pattern in internal:
+            await a._unsubscribe(pattern, a._state_patterns, a._sub)
+            await a._unsubscribe(pattern, a._object_patterns, a._osub)
+
+        assert internal <= a._state_patterns | a._object_patterns, (
+            "without its messagebox or sigKill the adapter answers nothing and cannot be stopped"
+        )
 
 
 class TestObjectSubscriptions:
