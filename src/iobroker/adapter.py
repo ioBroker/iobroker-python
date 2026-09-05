@@ -498,7 +498,13 @@ class Adapter:
 
     async def _view_keys(self, view: str) -> list[str]:
         """Collect the object keys of one type, from the index when there is one."""
-        use_sets = await self._objects.get("meta.objects.features.useSets")
+        # Never ask the built-in servers: they do not implement smembers, and the attempt is
+        # not silent -- the controller logs "smembers NOT SUPPORTED" for every view an adapter
+        # opens. Suppressing the exception below still leaves that line in the user's log.
+        # (sadd, used when writing objects, *is* supported there, so only this side is gated.)
+        use_sets = None
+        if not self._objects_cfg.is_builtin:
+            use_sets = await self._objects.get("meta.objects.features.useSets")
 
         if use_sets and int(use_sets):
             with contextlib.suppress(Exception):
