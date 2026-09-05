@@ -550,6 +550,34 @@ class Adapter:
             if value
         }
 
+    async def get_object_list(self) -> dict[str, dict[str, Any]]:
+        """Read every object in the system, keyed by id -- the counterpart of ``getObjectList``.
+
+        A script engine needs this: resolving an object's name, its channel or the enums it belongs
+        to has to answer synchronously while a handler runs, and that is only possible from a cache
+        held in the process. The JS script engine loads the same way ("requesting all objects") and
+        keeps it current through a subscription.
+
+        Protected native entries are stripped, exactly as in :meth:`get_foreign_object` -- a bulk
+        read must not be the loophole around ``protectedNative``.
+        """
+        keys = await self._objects.keys(f"{OBJECTS_PREFIX}*")
+        if not keys:
+            return {}
+
+        objects: dict[str, dict[str, Any]] = {}
+        # In batches: a large installation has tens of thousands of objects, and one mget with all
+        # of them builds a single reply big enough to matter on a small machine.
+        for start in range(0, len(keys), 1000):
+            batch = keys[start : start + 1000]
+            for key, value in zip(batch, await self._objects.mget(batch)):
+                if not value:
+                    continue
+                id = key[len(OBJECTS_PREFIX) :]
+                objects[id] = strip_protected(self.name, id, json.loads(value))
+
+        return objects
+
     # -- Files ------------------------------------------------------------
 
     def _file_client(self) -> Any:
