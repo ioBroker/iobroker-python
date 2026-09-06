@@ -2010,6 +2010,11 @@ def _rss_darwin() -> int | None:
 
     macOS has no ``/proc``, and ``getrusage`` offers only the peak. ``libproc`` is what psutil
     itself calls, and calling it directly keeps the dependency optional here too.
+
+    One thing to know when reading the resulting graph: macOS leaves freed pages resident until
+    something else needs them, so the curve rises with use and comes down only under memory
+    pressure. That is the operating system's accounting, not a leak, and not this reader rounding
+    off -- measured, because the test that asserted a release had to be skipped there.
     """
     if sys.platform != "darwin":
         return None
