@@ -189,16 +189,32 @@ Files and logs have the same pair each:
 | | |
 |---|---|
 | `subscribe_foreign_files(id, pattern)` | files of `id`, delivered to `on_file_change(id, name, size)` |
-| `subscribe_logs(pattern)` | other adapters' log lines, delivered to `on_log(entry)` |
+| `subscribe_logs()` | the whole system's log, delivered to `on_log(entry)` |
 
 `on_file_change` carries the new byte length, not the content -- that is what ioBroker publishes,
 and it keeps a large file out of every subscriber's socket. `None` means the file was deleted. Read
 the file with `read_file` when a handler actually needs it.
 
-`subscribe_logs` is what ioBroker calls a log transporter. A host only forwards its adapters' logs
-to the database once something has asked for them, which an adapter announces with
-`common.logTransporter` in its io-package.json. Subscribing without that setting is not an error --
-the subscription simply stays quiet.
+`subscribe_logs` is what ioBroker calls a log transporter, and it takes no pattern: the log channel
+is named after the *receiver*, not the sender, so a collector gets all of it or none. Calling it
+raises this instance's `.logging` flag and subscribes to its own channel; every adapter in the
+system reads those flags and pushes each of its records to every raised one. An adapter that means
+to do this should also declare `common.logTransporter` in its io-package.json -- that is what makes
+the *host* forward what it captured, including the log of adapters that crashed before they could
+write anything themselves.
+
+## Logging
+
+`self.log.info(...)` and its four siblings write to two places.
+
+**stdout**, always. The controller captures it and re-logs it under the host, which is what a user
+watching the console sees and what survives when the databases are gone.
+
+**Everyone who asked for the log** -- admin while its log tab is open, and any log-collecting
+adapter. Each record is published once per receiver, on `log.<their instance id>`. This is the
+route that puts a line in admin's log tab attributed to *this instance*, so that filtering by
+instance finds it. With nobody listening nothing is published at all, which keeps a chatty `silly`
+level from costing a database write per line.
 
 ## Files
 

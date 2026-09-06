@@ -76,6 +76,13 @@ _HEARTBEAT_STEPS = 15
 #: Bytes in a megabyte, the unit the memory states are read in.
 _MB = 1024 * 1024
 
+#: Where every instance object lives. Also the prefix of the ``.logging`` states that say which
+#: instances want to be sent the log.
+_INSTANCE_PREFIX = "system.adapter."
+
+#: The state an instance sets to ``true`` to ask every adapter for its log.
+_LOGGING_SUFFIX = ".logging"
+
 
 class Adapter:
     """Base class for a Python adapter.
@@ -163,6 +170,14 @@ class Adapter:
         self.input_count = 0
         #: States this adapter wrote in the current reporting period, reported as ``outputCount``.
         self.output_count = 0
+        #: The instances that have asked to be sent this adapter's log, by instance id. Kept
+        #: current from the ``system.adapter.*.logging`` states, which is how ioBroker does it:
+        #: a log transporter -- admin, while its log tab is open -- sets its own flag, and every
+        #: adapter then pushes each record to that instance's channel.
+        self._log_targets: set[str] = set()
+        #: Sequence number on each record. ioBroker's own client numbers them, and a receiver has
+        #: nothing else to tell two identical lines apart with.
+        self._log_id = 0
         #: Wall clock and CPU time at the last report, which is what turns ``time.process_time()``
         #: into the percentage `cpu` wants. Taken here rather than at the first beat so the first
         #: report covers the startup too, where an adapter usually does its most expensive work.
@@ -301,11 +316,13 @@ class Adapter:
         Only reaches an adapter that called :meth:`subscribe_logs`. In ioBroker this is what a log
         transporter does -- an adapter that collects the log rather than writing to it.
 
-        Do not log from this hook without a very good reason: the line written arrives back here,
-        gets logged again, and the loop is bounded only by how fast the database is.
+        Do not log from this hook without a very good reason. An adapter's own records are not sent
+        to itself, so the obvious loop is closed, but two collectors that both log what they
+        receive will happily feed each other.
 
-        :param entry: the record as it travelled, with ``message``, ``severity``, ``from`` and
-            ``ts``
+        :param entry: the record as it travelled: ``message``, ``severity``, ``ts``, ``from`` (the
+            sender's namespace, ``hue.0``, not its instance id) and ``_id``, the sender's sequence
+            number
         """
 
     async def on_unload(self) -> None:
@@ -381,6 +398,11 @@ class Adapter:
         self._state_patterns.add(f"{MESSAGE_PREFIX}{self.instance_id}")
         self._state_patterns.add(f"{STATES_PREFIX}{self.instance_id}.sigKill")
 
+        # Who wants to be sent our log. Watched rather than read once: admin sets its flag when a
+        # user opens the log tab and clears it again afterwards, so the answer changes while the
+        # adapter runs.
+        self._state_patterns.add(f"{STATES_PREFIX}{_INSTANCE_PREFIX}*{_LOGGING_SUFFIX}")
+
         # Watch system.config so a change to defaultNewAcl made in admin takes effect without a
         # restart -- the JS objects client subscribes to the very same object for the very same
         # reason.
@@ -390,6 +412,10 @@ class Adapter:
 
         self._sub = await self._open_subscription(self._states, self._state_patterns)
         self._pump = asyncio.create_task(self._run_pump("states"))
+
+        # After the subscription, never before: a flag set in between would otherwise be missed,
+        # and the adapter would stay silent in admin until something changed it again.
+        await self._load_log_targets()
 
         self._osub = await self._open_subscription(self._objects, self._object_patterns)
         self._opump = asyncio.create_task(self._run_pump("objects"))
@@ -438,6 +464,52 @@ class Adapter:
                 # Carrying on with encrypted values would fail later at the device, far from the
                 # cause, so say it here.
                 self.log.error(f"Cannot decrypt the configuration: {exc}")
+
+    async def _load_log_targets(self) -> None:
+        """Find the instances that already want the log, before anything is written.
+
+        A transporter that was started first has its flag set long before this adapter existed, and
+        a subscription only reports changes. Without this pass an adapter would reach admin's log
+        tab only after the user closed and reopened it.
+        """
+        pattern = f"{STATES_PREFIX}{_INSTANCE_PREFIX}*{_LOGGING_SUFFIX}"
+
+        with contextlib.suppress(Exception):
+            keys = await self._states.keys(pattern)
+            if not keys:
+                return
+            for key, raw in zip(keys, await self._states.mget(keys)):
+                id = key[len(STATES_PREFIX) :] if key.startswith(STATES_PREFIX) else key
+                self._note_log_target(id, raw)
+
+    def _note_log_target(self, id: str, data: Any) -> None:
+        """Add or drop one receiver, from the value of its ``.logging`` state.
+
+        ``"true"`` as a string counts as well: the flag has been written by many versions of many
+        adapters, and the JS client accepts both spellings for exactly that reason.
+
+        Our own flag is ignored. An adapter that collects the log and also writes it would
+        otherwise send every record to itself, log whatever the handler logs, and so on -- a loop
+        bounded only by how fast the database is.
+
+        :param id: the state's id, ``system.adapter.<namespace>.logging``
+        :param data: the state as stored, or ``None``/``"null"`` when it was deleted
+        """
+        target = id[: -len(_LOGGING_SUFFIX)]
+
+        if target == self.instance_id:
+            return
+
+        wants = False
+        if data and data != "null":
+            with contextlib.suppress(Exception):
+                value = json.loads(data).get("val")
+                wants = value is True or value == "true"
+
+        if wants:
+            self._log_targets.add(target)
+        else:
+            self._log_targets.discard(target)
 
     async def get_system_secret(self) -> str:
         """Read the system secret used to encrypt configuration values.
@@ -757,29 +829,38 @@ class Adapter:
             self._osub,
         )
 
-    async def subscribe_logs(self, pattern: str = "*") -> None:
-        """Receive the log of other adapters, delivered to :meth:`on_log`.
+    async def subscribe_logs(self) -> None:
+        """Collect the whole system's log, delivered to :meth:`on_log`.
 
-        What ioBroker calls a log transporter. The pattern names instances, so ``"*"`` is the whole
-        system and ``"system.adapter.hue.0"`` is one adapter.
+        What ioBroker calls a log transporter -- an adapter that collects the log rather than
+        writing to it. All of it or none: there is no pattern, because the channel is named after
+        the *receiver*, not the sender. Every adapter reads the ``.logging`` flags, sees this one
+        set, and pushes each of its records to this instance's channel.
 
-        A host only forwards its adapters' logs to the database once something has asked for them,
-        which an adapter announces with ``common.logTransporter`` in its io-package.json.
-        Subscribing without that setting is not an error -- the subscription simply stays quiet,
-        which is a confusing way to find that out, so it is worth saying here.
+        Two things happen here, and both are needed. The flag is what makes the others send, and
+        the subscription is what receives; setting the flag without subscribing is a system busily
+        publishing into a channel nobody reads.
 
-        :param pattern: which instances to listen to; ``"*"`` is the whole system
+        An adapter that means to do this should also declare ``common.logTransporter`` in its
+        io-package.json. That is what makes the *host* forward what it captured -- the log of
+        adapters that crashed before they could write anything themselves, and the host's own.
+
+        Not called by an ordinary adapter. Writing the log is :attr:`log`; this is for collecting
+        everybody else's.
         """
-        full = f"{LOG_PREFIX}{pattern}"
-        self._state_patterns.add(full)
-        await self._sub.psubscribe(full)
+        channel = f"{LOG_PREFIX}{self.instance_id}"
+        self._state_patterns.add(channel)
+        await self._sub.psubscribe(channel)
+        await self.set_foreign_state(f"{self.instance_id}{_LOGGING_SUFFIX}", True, ack=True)
 
-    async def unsubscribe_logs(self, pattern: str = "*") -> None:
-        """Stop receiving other adapters' log.
+    async def unsubscribe_logs(self) -> None:
+        """Stop collecting the log.
 
-        :param pattern: the pattern that was subscribed
+        Clears the flag first: the senders stop as soon as they see it, and a record already on its
+        way then arrives at a channel that is still subscribed rather than at nobody.
         """
-        await self._unsubscribe(f"{LOG_PREFIX}{pattern}", self._state_patterns, self._sub)
+        await self.set_foreign_state(f"{self.instance_id}{_LOGGING_SUFFIX}", False, ack=True)
+        await self._unsubscribe(f"{LOG_PREFIX}{self.instance_id}", self._state_patterns, self._sub)
 
     async def _unsubscribe(self, full: str, patterns: set[str], sub: Any) -> None:
         """Drop one recorded pattern and tell the server, if there is one yet.
@@ -1519,6 +1600,13 @@ class Adapter:
                         self._stopping.set()
             return
 
+        # Somebody's log flag. Consumed rather than passed on, as adapter-core consumes it: it is
+        # bookkeeping for this adapter, and a handler that saw it could only be confused by a state
+        # it never subscribed to -- the pattern behind it is one of ours.
+        if state_id.startswith(_INSTANCE_PREFIX) and state_id.endswith(_LOGGING_SUFFIX):
+            self._note_log_target(state_id, data)
+            return
+
         # Expiry: the built-in server publishes "null" on the state channel
         # itself. Real Redis instead reports through __keyevent@<db>__:expired,
         # which would need a separate subscription.
@@ -1803,35 +1891,59 @@ class _Log:
             self._py.setLevel(logging.DEBUG)
 
     def _emit(self, severity: str, message: str, **kwargs: Any) -> None:
-        """Write one record to both destinations, or to neither.
+        """Write one record to stdout and to whoever asked for the log, or to neither.
 
-        The level is checked once, here, so stdout and the channel never disagree about what was
-        logged. Publishing to the channel is fire-and-forget: it becomes a task rather than being
-        awaited, because logging has to work from synchronous code as well and must never be the
-        thing that fails a handler. A failure to publish is therefore swallowed -- stdout still has
-        the line, and the controller forwards stdout.
+        The level is checked once, here, so the two destinations never disagree about what was
+        logged.
+
+        stdout is the one that always happens: the controller captures it and re-logs it under the
+        host, which is what puts a Python adapter's output in the host's log file and in front of a
+        user who is watching a crash. It is also the only route left once the databases are gone.
+
+        The other destination is every instance that asked to be sent the log -- admin while its
+        log tab is open, and any log-collecting adapter. The channel is named after the *receiver*:
+        each record is published once per receiver, on ``log.<their instance id>``, which is what
+        ioBroker's own client does in ``pushLog``. Publishing to a channel named after the sender
+        instead reaches nobody, and is why these lines used to appear in admin attributed to the
+        host rather than to the instance that wrote them.
+
+        Fire-and-forget: the publish becomes a task rather than being awaited, because logging has
+        to work from synchronous code as well and must never be the thing that fails a handler. A
+        failure is swallowed for the same reason -- stdout still has the line.
         """
         threshold = _LEVELS.get(self._adapter._loglevel, 20)
         if _LEVELS.get(severity, 20) < threshold:
             return
+
         getattr(self._py, "warning" if severity == "warn" else severity, self._py.info)(
             message, **kwargs
         )
+
         states = self._adapter._states
-        if states is None:
+        targets = self._adapter._log_targets
+
+        if states is None or not targets:
             return
+
+        self._adapter._log_id += 1
         payload = json.dumps(
             {
-                "message": message,
-                "severity": severity,
-                "from": self._adapter.instance_id,
+                "_id": self._adapter._log_id,
+                # The namespace, not the instance id: `hue.0`, which is what admin shows in the
+                # "from" column and what ioBroker's own records carry.
+                "from": self._adapter.namespace,
                 "ts": now_ms(),
+                "severity": severity,
+                "message": message,
             }
         )
+
         with contextlib.suppress(Exception):
-            asyncio.get_running_loop().create_task(
-                states.publish(f"{LOG_PREFIX}{self._adapter.instance_id}", payload)
-            )
+            loop = asyncio.get_running_loop()
+            # A copy: a flag can change while these tasks are still queued, and iterating the live
+            # set would then raise inside a log call.
+            for target in list(targets):
+                loop.create_task(states.publish(f"{LOG_PREFIX}{target}", payload))
 
     def silly(self, message: str, **kw: Any) -> None:
         """The finest level -- wire traffic and the like. Off in every normal installation."""

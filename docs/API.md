@@ -203,12 +203,13 @@ A log line from somewhere else in the system.
 Only reaches an adapter that called `subscribe_logs()`. In ioBroker this is what a log
 transporter does — an adapter that collects the log rather than writing to it.
 
-Do not log from this hook without a very good reason: the line written arrives back here,
-gets logged again, and the loop is bounded only by how fast the database is.
+Do not log from this hook without a very good reason. An adapter's own records are not sent
+to itself, so the obvious loop is closed, but two collectors that both log what they
+receive will happily feed each other.
 
 **Parameters**
 
-- `entry` — the record as it travelled, with `message`, `severity`, `from` and `ts`
+- `entry` — the record as it travelled: `message`, `severity`, `ts`, `from` (the sender's namespace, `hue.0`, not its instance id) and `_id`, the sender's sequence number
 
 ##### on_unload
 
@@ -566,34 +567,37 @@ Both halves have to match what was subscribed — the owning id as well as the p
 ##### subscribe_logs
 
 ```python
-async subscribe_logs(pattern: str = '*') -> None
+async subscribe_logs() -> None
 ```
 
-Receive the log of other adapters, delivered to `on_log()`.
+Collect the whole system's log, delivered to `on_log()`.
 
-What ioBroker calls a log transporter. The pattern names instances, so `"*"` is the whole
-system and `"system.adapter.hue.0"` is one adapter.
+What ioBroker calls a log transporter — an adapter that collects the log rather than
+writing to it. All of it or none: there is no pattern, because the channel is named after
+the *receiver*, not the sender. Every adapter reads the `.logging` flags, sees this one
+set, and pushes each of its records to this instance's channel.
 
-A host only forwards its adapters' logs to the database once something has asked for them,
-which an adapter announces with `common.logTransporter` in its io-package.json.
-Subscribing without that setting is not an error — the subscription simply stays quiet,
-which is a confusing way to find that out, so it is worth saying here.
+Two things happen here, and both are needed. The flag is what makes the others send, and
+the subscription is what receives; setting the flag without subscribing is a system busily
+publishing into a channel nobody reads.
 
-**Parameters**
+An adapter that means to do this should also declare `common.logTransporter` in its
+io-package.json. That is what makes the *host* forward what it captured — the log of
+adapters that crashed before they could write anything themselves, and the host's own.
 
-- `pattern` — which instances to listen to; `"*"` is the whole system
+Not called by an ordinary adapter. Writing the log is `log`; this is for collecting
+everybody else's.
 
 ##### unsubscribe_logs
 
 ```python
-async unsubscribe_logs(pattern: str = '*') -> None
+async unsubscribe_logs() -> None
 ```
 
-Stop receiving other adapters' log.
+Stop collecting the log.
 
-**Parameters**
-
-- `pattern` — the pattern that was subscribed
+Clears the flag first: the senders stop as soon as they see it, and a record already on its
+way then arrives at a channel that is still subscribed rather than at nobody.
 
 #### Objects
 
