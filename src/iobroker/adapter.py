@@ -166,7 +166,12 @@ class Adapter:
         #: Wall clock and CPU time at the last report, which is what turns ``time.process_time()``
         #: into the percentage `cpu` wants. Taken here rather than at the first beat so the first
         #: report covers the startup too, where an adapter usually does its most expensive work.
-        self._cpu_mark = (time.monotonic(), time.process_time())
+        #:
+        #: ``perf_counter`` rather than ``monotonic``: on Windows before Python 3.13 the latter
+        #: ticks every 15.6 ms, and two reads inside one tick are equal. A startup that finished
+        #: within a tick then divided by zero elapsed time and reported no CPU at all -- which is
+        #: how CI caught this, on exactly those Python versions and no others.
+        self._cpu_mark = (time.perf_counter(), time.process_time())
         self._exit_code = int(ExitCode.NO_ERROR)
         self._loglevel = os.environ.get("IOB_LOGLEVEL") or _read_loglevel()
 
@@ -1589,7 +1594,7 @@ class Adapter:
         lags: list[float] = []
 
         for _ in range(_HEARTBEAT_STEPS):
-            started = time.monotonic()
+            started = time.perf_counter()
             try:
                 # Waiting on the stop flag rather than sleeping is what makes a shutdown
                 # immediate: the flag being set -- already, or during this second -- ends the
@@ -1599,7 +1604,9 @@ class Adapter:
             except asyncio.TimeoutError:
                 pass
 
-            lags.append(max(0.0, (time.monotonic() - started - _HEARTBEAT_STEP_SECONDS) * 1000))
+            # perf_counter for the same reason the CPU mark uses it: on a coarse clock every lag
+            # below one tick reads as zero, which would report a healthy loop on no evidence.
+            lags.append(max(0.0, (time.perf_counter() - started - _HEARTBEAT_STEP_SECONDS) * 1000))
 
         return lags
 
@@ -1670,7 +1677,7 @@ class Adapter:
 
         :returns: the percentage, or ``None`` when no time has passed to divide by
         """
-        now, cpu = time.monotonic(), time.process_time()
+        now, cpu = time.perf_counter(), time.process_time()
         previous_wall, previous_cpu = self._cpu_mark
         self._cpu_mark = (now, cpu)
 

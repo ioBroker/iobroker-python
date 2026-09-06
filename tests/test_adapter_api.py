@@ -102,6 +102,15 @@ class TestResidentMemory:
 
 
 class TestCpuPercent:
+    def test_reports_something_even_on_a_coarse_clock(self, adapter: Adapter) -> None:
+        """Two reports in quick succession still have to produce a number.
+
+        The interval is measured with `perf_counter`, not `monotonic`: on Windows before 3.13 the
+        latter ticks every 15.6 ms, so a report that followed startup within one tick divided by
+        zero and skipped `cpu` entirely -- leaving the row empty in admin exactly as before.
+        """
+        assert adapter._cpu_percent() is not None
+
     def test_answers_in_percent_of_one_core(self, adapter: Adapter) -> None:
         """Busy work between two reports has to show up as CPU.
 
@@ -109,10 +118,10 @@ class TestCpuPercent:
         passed. Burning a whole interval on one thread is therefore close to 100, and the only
         thing asserted here is the part that cannot be a coincidence: it is well above zero.
         """
-        adapter._cpu_percent()  # first call only sets the mark
+        adapter._cpu_percent()  # first call only re-marks; the mark itself is set in __init__
 
-        deadline = time.monotonic() + 0.2
-        while time.monotonic() < deadline:
+        deadline = time.perf_counter() + 0.2
+        while time.perf_counter() < deadline:
             pass
 
         percent = adapter._cpu_percent()
@@ -173,8 +182,8 @@ class TestEventLoopLag:
         """
         adapter._stopping.set()
 
-        started = time.monotonic()
+        started = time.perf_counter()
         lags = await adapter._wait_measuring_lag()
 
-        assert time.monotonic() - started < 1
+        assert time.perf_counter() - started < 1
         assert lags == []
