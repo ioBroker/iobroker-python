@@ -227,8 +227,41 @@ Two things about the built-in server are worth knowing, both measured rather tha
 
 ## Lifecycle
 
-`alive`, `connected`, `uptime` and `memRss` are written by the adapter itself
-through the states database — exactly like a Node adapter. Stopping goes through
+### What the instance reports about itself
+
+Every fifteen seconds the adapter writes the states admin draws its instance
+graphs from — the same set `adapter-core` reports, and for the same reason:
+nothing else knows them. The controller sees a process, not what that process is
+doing with its memory.
+
+| State | What it is |
+| --- | --- |
+| `alive`, `connected` | the process is running, and reaches the databases |
+| `uptime` | seconds since the adapter started |
+| `cpu` | percent of one core used since the last report; over 100 on several cores |
+| `cputime` | CPU seconds the process has accumulated |
+| `memRss` | resident set size in MB — the memory actually held in RAM |
+| `eventLoopLag` | how late a one-second timer was, averaged over the period |
+| `inputCount`, `outputCount` | states received and written in the period |
+| `compactMode` | always `false`; a Python adapter cannot run in the controller's process |
+
+All of them carry a 25-second expiry, so a process that was killed outright stops
+claiming to be alive instead of leaving a stale row in admin.
+
+`eventLoopLag` is worth watching. Everything in an adapter shares one asyncio
+loop, and a synchronous call that takes a second stops the heartbeat, the
+messagebox and every subscription for that second. The lag names that cause
+instead of leaving a gap in the graphs that looks like a crash.
+
+Two states a Node adapter fills stay empty: `memHeapTotal` and `memHeapUsed` are
+V8's heap, and CPython has no comparable number. Its allocator publishes no
+total, and the one figure that could be measured (`tracemalloc`) costs several
+times the memory it reports. A wrong number in a graph is worse than an empty
+one.
+
+### Stopping
+
+Stopping goes through
 the `sigKill` state: when the controller sets it to `-1`, the adapter shuts down
 in an orderly fashion. That makes stopping work on Windows too, where there is
 no `SIGTERM`. Any other value is the PID the controller believes it supervises:

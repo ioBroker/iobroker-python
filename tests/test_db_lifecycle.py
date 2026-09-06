@@ -554,3 +554,77 @@ class TestLogChannel:
             assert not any("must not appear" in data for data in seen)
         finally:
             await ps.aclose()
+
+
+class TestStatusReport:
+    """The states admin draws its instance graphs from.
+
+    Written by this SDK for the same reason adapter-core writes them in the Node world: nothing
+    else knows them. The controller sees a process, not what that process is doing with its memory.
+    Before these existed, a Python instance showed `alive` and `uptime` in admin and nothing else --
+    every memory and CPU row sat at `(null)`.
+    """
+
+    async def test_writes_what_admin_graphs(self, run_adapter, raw) -> None:
+        a, _task = await run_adapter()
+
+        await a._report_status([4.0, 6.0])
+
+        for name in ("cpu", "cputime", "memRss", "uptime", "inputCount", "outputCount"):
+            state = await read_state(raw, f"{a.instance_id}.{name}")
+            assert state is not None, f"{name} was not written"
+            assert isinstance(state["val"], (int, float)), f"{name} is not a number"
+            assert state["val"] >= 0, f"{name} is negative"
+            # Acknowledged and attributed, or admin shows them as somebody else's command.
+            assert state["ack"] is True and state["from"] == a.instance_id
+
+    async def test_the_lag_is_the_average_rounded_up(self, run_adapter, raw) -> None:
+        a, _task = await run_adapter()
+
+        await a._report_status([4.0, 6.0, 5.2])
+
+        # ceil(15.2 / 3) = 6. Rounded up rather than to nearest, as js-controller does it: a lag
+        # under half a millisecond should read as "a little", not as "none".
+        assert (await read_state(raw, f"{a.instance_id}.eventLoopLag"))["val"] == 6
+
+    async def test_a_period_without_measurements_leaves_the_lag_alone(self, run_adapter, raw) -> None:
+        a, _task = await run_adapter()
+
+        await a._report_status([])
+
+        # Not zero: nothing was measured, and writing 0 would claim a healthy loop on the strength
+        # of no evidence -- the one reading a user would take at face value.
+        assert await read_state(raw, f"{a.instance_id}.eventLoopLag") is None
+
+    async def test_compact_mode_is_answered_at_startup(self, run_adapter, raw) -> None:
+        # False, not empty. A Python adapter can never run in compact mode, and an empty indicator
+        # in admin reads as "unknown" rather than as "no".
+        a, _task = await run_adapter()
+
+        state = await read_state(raw, f"{a.instance_id}.compactMode")
+
+        assert state is not None and state["val"] is False
+
+    async def test_the_counters_count_and_then_start_over(self, run_adapter, raw) -> None:
+        a, _task = await run_adapter()
+        await a.subscribe_states("*")
+
+        a.input_count = 0
+        a.output_count = 0
+        await a.set_state("counted", 1, ack=True)
+        written = a.output_count
+
+        await drive(
+            lambda: write_state(raw, f"{a.namespace}.arrived", wire_state(2)),
+            a.state_events,
+            lambda e: e[0] == f"{a.namespace}.arrived",
+        )
+
+        assert written == 1, "a state written was not counted"
+        assert a.input_count >= 1, "a state received was not counted"
+
+        await a._report_status([])
+
+        # Per period, not since startup: a report leaves both at zero, so the next value is the
+        # traffic of the next fifteen seconds rather than a number that only grows.
+        assert a.input_count == 0 and a.output_count == 0

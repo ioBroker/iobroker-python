@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -65,6 +66,16 @@ _LEVELS = {"silly": 10, "debug": 10, "info": 20, "warn": 30, "error": 40}
 #: killed outright stop claiming to be alive, instead of leaving the state true forever.
 _STATUS_EXPIRE_SECONDS = 25
 
+#: One measuring step of the heartbeat. The event-loop lag is sampled once per step, at the same
+#: one-second interval js-controller samples its own with.
+_HEARTBEAT_STEP_SECONDS = 1.0
+
+#: Steps per report -- 15 s, adapter-core's ``statisticsInterval``.
+_HEARTBEAT_STEPS = 15
+
+#: Bytes in a megabyte, the unit the memory states are read in.
+_MB = 1024 * 1024
+
 
 class Adapter:
     """Base class for a Python adapter.
@@ -91,6 +102,8 @@ class Adapter:
     * ``namespace`` -- ``<name>.<instance>``, the prefix of everything this adapter owns.
     * ``instance_id`` -- ``system.adapter.<namespace>``, the id of the instance object itself.
     * ``connected`` -- whether the link to the databases is up.
+    * ``input_count`` / ``output_count`` -- states received and written since the last status
+      report, reported as ``inputCount`` and ``outputCount`` and reset every fifteen seconds.
 
     **Own ids versus foreign ones**
 
@@ -144,6 +157,16 @@ class Adapter:
         self._alive: asyncio.Task | None = None
         self._stopping = asyncio.Event()
         self._started = time.time()
+        #: States this adapter received in the current reporting period, reported as
+        #: ``inputCount``. Every message any subscription delivered counts: states, objects,
+        #: files, log lines, messagebox.
+        self.input_count = 0
+        #: States this adapter wrote in the current reporting period, reported as ``outputCount``.
+        self.output_count = 0
+        #: Wall clock and CPU time at the last report, which is what turns ``time.process_time()``
+        #: into the percentage `cpu` wants. Taken here rather than at the first beat so the first
+        #: report covers the startup too, where an adapter usually does its most expensive work.
+        self._cpu_mark = (time.monotonic(), time.process_time())
         self._exit_code = int(ExitCode.NO_ERROR)
         self._loglevel = os.environ.get("IOB_LOGLEVEL") or _read_loglevel()
 
@@ -367,6 +390,10 @@ class Adapter:
         self._opump = asyncio.create_task(self._run_pump("objects"))
 
         await self.set_state("info.connection", False, ack=True)
+        # Never true for a Python adapter: compact mode loads an adapter into the controller's own
+        # Node.js process, and the controller refuses the combination outright. Written once rather
+        # than left empty, because an empty indicator in admin reads as "unknown", not as "no".
+        await self.set_foreign_state(f"{self.instance_id}.compactMode", False, ack=True)
         await self._set_alive(True)
         await self._set_connected(True)
         self._alive = asyncio.create_task(self._heartbeat())
@@ -541,6 +568,10 @@ class Adapter:
                 wire["lc"] = previous["lc"]
 
         payload = json.dumps(wire)
+
+        # Counted here rather than in `set_state`, so the two forms and everything inside the SDK
+        # that writes a state -- the status report included -- land in the same number.
+        self.output_count += 1
 
         pipe = self._states.pipeline(transaction=True)
         if expire:
@@ -942,6 +973,7 @@ class Adapter:
 
         :param id: absolute id
         """
+        self.output_count += 1
         key = f"{STATES_PREFIX}{id}"
         await self._states.delete(key)
         await self._states.publish(key, "null")
@@ -1243,6 +1275,7 @@ class Adapter:
         :param command: what the receiver switches on in its ``on_message``
         :param message: the payload, anything JSON can carry
         """
+        self.output_count += 1
         payload = {
             "command": command,
             "message": message,
@@ -1268,6 +1301,7 @@ class Adapter:
         """
         if not msg.callback:
             return
+        self.output_count += 1
         callback = dict(msg.callback)
         callback["ack"] = True
         payload = {
@@ -1391,6 +1425,11 @@ class Adapter:
         :param channel: the channel the message was published on, prefix and all
         :param data: the payload, JSON in every case except a deletion, which sends ``"null"``
         """
+        # Counted before it is routed, and for every kind: `inputCount` answers "how much is this
+        # adapter being asked to handle", and a file change or a log line costs the same event loop
+        # a state change does.
+        self.input_count += 1
+
         # Files travel on the objects connection as well, under their own prefix. Checked before
         # objects because `cfg.f.` and `cfg.o.` only differ in one character, and getting the order
         # wrong would hand a file change to `on_object_change` as an object that will not parse.
@@ -1515,34 +1554,131 @@ class Adapter:
         )
 
     async def _heartbeat(self) -> None:
-        """Keep alive/connected/uptime/memRss current -- just like a Node adapter does.
+        """Report the instance's status every 15 seconds -- just like a Node adapter does.
 
-        Every 15 seconds, which is what the expiry on those states is dimensioned for: they lapse
-        after 25, so one missed beat is survivable and a dead process stops claiming to be alive
-        within half a minute.
+        Fifteen seconds is what the expiry on those states is dimensioned for: they lapse after 25,
+        so one missed beat is survivable and a process that was killed outright stops claiming to
+        be alive within half a minute.
+
+        The wait is broken into one-second steps rather than one ``sleep(15)``, for two reasons.
+        A shutdown no longer waits for the rest of the interval; and each step measures how late
+        its own timer was, which is the event-loop lag reported at the end of the period.
 
         Runs as its own task, cancelled during shutdown. Because it shares the event loop with
         everything else, a hook that blocks the loop stops the heartbeat too -- and an adapter that
-        looks dead in admin while its process is plainly running is usually exactly that.
+        looks dead in admin while its process is plainly running is usually exactly that. Which is
+        also what makes ``eventLoopLag`` worth reporting: it names that cause instead of leaving a
+        gap in the graphs.
         """
         try:
             while not self._stopping.is_set():
-                await asyncio.sleep(15)
+                lags = await self._wait_measuring_lag()
                 if self._stopping.is_set():
                     break
-                await self._set_alive(True)
-                if self.connected:
-                    await self._set_connected(True)
-                await self.set_foreign_state(
-                    f"{self.instance_id}.uptime", int(time.time() - self._started), ack=True
-                )
-                rss = _rss_mb()
-                if rss is not None:
-                    await self.set_foreign_state(
-                        f"{self.instance_id}.memRss", rss, ack=True
-                    )
+                await self._report_status(lags)
         except asyncio.CancelledError:
             raise
+
+    async def _wait_measuring_lag(self) -> list[float]:
+        """Wait one reporting period, returning how late each second was, in milliseconds.
+
+        The lag is what the loop owes: a timer asked to fire in one second that fires later was
+        held up by something that did not yield. Clamped at zero -- a timer firing early is a clock
+        artefact, not negative lag.
+        """
+        lags: list[float] = []
+
+        for _ in range(_HEARTBEAT_STEPS):
+            started = time.monotonic()
+            try:
+                # Waiting on the stop flag rather than sleeping is what makes a shutdown
+                # immediate: the flag being set -- already, or during this second -- ends the
+                # wait at once, and the partial measurement is dropped rather than reported.
+                await asyncio.wait_for(self._stopping.wait(), timeout=_HEARTBEAT_STEP_SECONDS)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            lags.append(max(0.0, (time.monotonic() - started - _HEARTBEAT_STEP_SECONDS) * 1000))
+
+        return lags
+
+    async def _report_status(self, lags: list[float]) -> None:
+        """Write the states admin shows for a running instance.
+
+        The same set adapter-core reports, and for the same reason: without them an instance has no
+        history in admin -- no memory curve, no CPU, nothing to look at when a user says it became
+        slow yesterday.
+
+        Two of the states a Node adapter writes are deliberately missing. ``memHeapTotal`` and
+        ``memHeapUsed`` are V8's heap, and CPython has no comparable number to put there: its
+        allocator does not publish a total, and the one figure that could be measured
+        (``tracemalloc``) costs several times the memory it reports. A wrong number in a graph is
+        worse than an empty one, so they stay empty.
+
+        :param lags: the per-second event-loop lag measured over the period, in milliseconds
+        """
+        await self._set_alive(True)
+        if self.connected:
+            await self._set_connected(True)
+
+        # Read before writing: the writes below are themselves output, and counting them would
+        # make the number about the reporting rather than about the adapter. adapter-core solves
+        # the same problem the same way.
+        received, written = self.input_count, self.output_count
+
+        await self._status("uptime", int(time.time() - self._started))
+        await self._status("cputime", round(time.process_time(), 2))
+
+        cpu = self._cpu_percent()
+        if cpu is not None:
+            await self._status("cpu", cpu)
+
+        rss = _rss_mb()
+        if rss is not None:
+            await self._status("memRss", rss)
+
+        if lags:
+            # Ceiling of the average, as js-controller reports it -- a sub-millisecond average
+            # rounded to 0 would read as "no lag measured" rather than "no lag".
+            await self._status("eventLoopLag", math.ceil(sum(lags) / len(lags)))
+
+        await self._status("inputCount", received)
+        await self._status("outputCount", written)
+
+        self.input_count = 0
+        self.output_count = 0
+
+    async def _status(self, name: str, value: Any) -> None:
+        """Write one of the instance's own status states, with the expiry they all carry.
+
+        The expiry is the point: a status state that outlives the process it describes is worse
+        than no state, because admin shows it as current.
+        """
+        await self.set_foreign_state(
+            f"{self.instance_id}.{name}", value, ack=True, expire=_STATUS_EXPIRE_SECONDS
+        )
+
+    def _cpu_percent(self) -> float | None:
+        """CPU used since the last report, as a percentage of one core.
+
+        ``time.process_time()`` is the process's own CPU time, user plus system, across all its
+        threads and excluding anything it slept through -- the same quantity ``pidusage`` reports
+        to a Node adapter. Divided by the wall-clock time that passed, it is the percentage the
+        state's unit already names: 100 means one core saturated, and on a multi-core machine more
+        than 100 is possible and correct.
+
+        :returns: the percentage, or ``None`` when no time has passed to divide by
+        """
+        now, cpu = time.monotonic(), time.process_time()
+        previous_wall, previous_cpu = self._cpu_mark
+        self._cpu_mark = (now, cpu)
+
+        elapsed = now - previous_wall
+        if elapsed <= 0:
+            return None
+
+        return round(100 * (cpu - previous_cpu) / elapsed, 2)
 
     # -- Shutdown ---------------------------------------------------------
 
@@ -1771,19 +1907,163 @@ def _read_loglevel() -> str:
 
 
 def _rss_mb() -> float | None:
-    """Memory usage in MB, without a hard dependency on psutil."""
-    try:
-        import resource  # POSIX
+    """Resident set size in MB: the memory this process actually holds in RAM.
 
-        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # Linux reports KB, macOS reports bytes.
-        return round(usage / (1024 if sys.platform != "darwin" else 1024 * 1024), 2)
-    except ImportError:
-        try:
-            import psutil  # optional, mainly for Windows
+    What ``memRss`` means, and what a Node adapter reports there from ``process.memoryUsage()``.
+    Not the peak, and not the virtual size -- the number a user watches to see whether an adapter
+    leaks.
 
-            return round(psutil.Process().memory_info().rss / (1024 * 1024), 2)
-        except Exception:  # noqa: BLE001
-            return None
-    except Exception:  # noqa: BLE001
+    Each operating system has to be asked in its own way, and none of them needs a dependency for
+    it. The order below is "cheapest first, and skip what cannot apply": every reader returns
+    ``None`` on a platform it does not serve, and an exception in one of them falls through to the
+    next rather than costing the whole report.
+
+    psutil comes last, not first. It would answer everywhere, but it is a compiled package, and an
+    adapter on a Raspberry Pi should not have to build one to have a memory graph.
+
+    :returns: resident size in MB, or ``None`` when no reader could answer
+    """
+    for reader in (_rss_linux, _rss_windows, _rss_darwin, _rss_psutil):
+        with contextlib.suppress(Exception):
+            value = reader()
+            if value is not None:
+                return round(value / _MB, 2)
+
+    return None
+
+
+def _rss_linux() -> int | None:
+    """Resident size from ``/proc/self/statm``, in bytes.
+
+    The second field is the resident page count. Reading it is a memory operation rather than a
+    disk one -- procfs is generated on read -- which is why this is done inline in the heartbeat
+    and not moved to a thread.
+    """
+    if not sys.platform.startswith("linux"):
         return None
+
+    with open("/proc/self/statm", encoding="ascii") as handle:
+        resident = int(handle.read().split()[1])
+
+    return resident * os.sysconf("SC_PAGE_SIZE")
+
+
+def _rss_windows() -> int | None:
+    """Resident size from ``GetProcessMemoryInfo``, in bytes.
+
+    ``WorkingSetSize`` is Windows' name for the same thing: the part of the process that is in
+    physical memory. Reached through ctypes rather than psutil, because this is the platform where
+    psutil is least likely to be installed -- the previous version of this function simply returned
+    ``None`` here, which is why ``memRss`` was empty in admin on every Windows installation.
+
+    The prototypes are declared rather than left to ctypes' defaults: a HANDLE is 64 bits on a
+    64-bit Windows, and the pseudo-handle for "this process" is ``-1``, which passed as a plain C
+    int would arrive truncated.
+    """
+    if sys.platform != "win32":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _MemoryCounters(ctypes.Structure):
+        """``PROCESS_MEMORY_COUNTERS`` -- the whole struct, since the API checks its size."""
+
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = []
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_MemoryCounters),
+        wintypes.DWORD,
+    ]
+
+    counters = _MemoryCounters()
+    counters.cb = ctypes.sizeof(_MemoryCounters)
+
+    if not psapi.GetProcessMemoryInfo(
+        kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+    ):
+        return None
+
+    return int(counters.WorkingSetSize)
+
+
+def _rss_darwin() -> int | None:
+    """Resident size from ``proc_pidinfo``, in bytes.
+
+    macOS has no ``/proc``, and ``getrusage`` offers only the peak. ``libproc`` is what psutil
+    itself calls, and calling it directly keeps the dependency optional here too.
+    """
+    if sys.platform != "darwin":
+        return None
+
+    import ctypes
+
+    class _TaskInfo(ctypes.Structure):
+        """``struct proc_taskinfo``. Declared in full because the call checks the buffer size."""
+
+        _fields_ = [
+            ("pti_virtual_size", ctypes.c_uint64),
+            ("pti_resident_size", ctypes.c_uint64),
+            ("pti_total_user", ctypes.c_uint64),
+            ("pti_total_system", ctypes.c_uint64),
+            ("pti_threads_user", ctypes.c_uint64),
+            ("pti_threads_system", ctypes.c_uint64),
+            ("pti_policy", ctypes.c_int32),
+            ("pti_faults", ctypes.c_int32),
+            ("pti_pageins", ctypes.c_int32),
+            ("pti_cow_faults", ctypes.c_int32),
+            ("pti_messages_sent", ctypes.c_int32),
+            ("pti_messages_received", ctypes.c_int32),
+            ("pti_syscalls_mach", ctypes.c_int32),
+            ("pti_syscalls_unix", ctypes.c_int32),
+            ("pti_csw", ctypes.c_int32),
+            ("pti_threadnum", ctypes.c_int32),
+            ("pti_numrunning", ctypes.c_int32),
+            ("pti_priority", ctypes.c_int32),
+        ]
+
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    libproc.proc_pidinfo.restype = ctypes.c_int
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+
+    info = _TaskInfo()
+    # PROC_PIDTASKINFO. A short answer means the call failed rather than that it told us less.
+    written = libproc.proc_pidinfo(
+        os.getpid(), 4, 0, ctypes.byref(info), ctypes.sizeof(_TaskInfo)
+    )
+
+    if written != ctypes.sizeof(_TaskInfo):
+        return None
+
+    return int(info.pti_resident_size)
+
+
+def _rss_psutil() -> int | None:
+    """Resident size from psutil, in bytes -- the fallback when it happens to be installed."""
+    import psutil
+
+    return int(psutil.Process().memory_info().rss)
