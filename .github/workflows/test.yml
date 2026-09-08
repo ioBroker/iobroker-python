@@ -115,3 +115,88 @@ jobs:
 
       - name: Run tests
         run: pytest -v
+
+  # Redis Sentinel, which is the one topology where the database's address is not configuration
+  # but an answer that changes while an adapter runs. A master, a replica and a sentinel, then a
+  # forced failover -- the only way to find out whether a client really follows the master.
+  #
+  # Linux only: Sentinel is what a redundant ioBroker installation runs on, and neither the
+  # Windows build nor the Homebrew formula is worth a second copy of this to keep working.
+  sentinel:
+    runs-on: ubuntu-latest
+    env:
+      IOB_TEST_SENTINELS: 127.0.0.1:26390
+      IOB_TEST_SENTINEL_NAME: mymaster
+      # A sentinel that did not come up must fail the job. Without this the tests would skip and
+      # the job would be green while proving nothing -- the same reason IOB_TEST_REQUIRE_REDIS
+      # exists above.
+      IOB_TEST_REQUIRE_SENTINEL: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install Redis
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y redis-server
+          sudo systemctl stop redis-server || true
+
+      # Ports well away from 6379: nothing else in this job uses Redis, but a stray default
+      # instance from the package must not be mistaken for the master under test.
+      - name: Start a master, a replica and a sentinel
+        run: |
+          mkdir -p "$RUNNER_TEMP/sentinel" && cd "$RUNNER_TEMP/sentinel"
+          cat > master.conf <<EOF
+          port 6390
+          bind 127.0.0.1
+          daemonize yes
+          dir $RUNNER_TEMP/sentinel
+          logfile $RUNNER_TEMP/sentinel/master.log
+          dbfilename master.rdb
+          EOF
+          cat > replica.conf <<EOF
+          port 6391
+          bind 127.0.0.1
+          daemonize yes
+          dir $RUNNER_TEMP/sentinel
+          logfile $RUNNER_TEMP/sentinel/replica.log
+          dbfilename replica.rdb
+          replicaof 127.0.0.1 6390
+          EOF
+          # Quorum 1 with a single sentinel: enough to agree with itself, which is all a forced
+          # failover needs. A production setup wants three, but a third of this file would then
+          # be sentinel configuration rather than the test.
+          cat > sentinel.conf <<EOF
+          port 26390
+          bind 127.0.0.1
+          daemonize yes
+          dir $RUNNER_TEMP/sentinel
+          logfile $RUNNER_TEMP/sentinel/sentinel.log
+          sentinel monitor mymaster 127.0.0.1 6390 1
+          sentinel down-after-milliseconds mymaster 5000
+          sentinel failover-timeout mymaster 10000
+          sentinel parallel-syncs mymaster 1
+          EOF
+          redis-server master.conf
+          redis-server replica.conf
+          sleep 1
+          redis-server sentinel.conf --sentinel
+          for _ in $(seq 1 30); do
+            if redis-cli -p 26390 sentinel get-master-addr-by-name mymaster | grep -q 6390; then
+              echo "Sentinel monitors the master"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "The sentinel setup did not come up"
+          tail -n 50 "$RUNNER_TEMP"/sentinel/*.log || true
+          exit 1
+
+      - name: Install package
+        run: pip install -e .[dev]
+
+      - name: Run the sentinel tests
+        run: pytest tests/test_sentinel.py -v

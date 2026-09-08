@@ -24,6 +24,14 @@ The four pitfalls:
 4. **No SCAN on the states database.** Only the objects database supports
    ``scan``/``sscan``. States are left with ``keys``, which blocks against real
    Redis but is harmless against the built-in server.
+
+None of that applies to a **Redis Sentinel** setup, which is by definition real
+Redis: there the address of the database is not configured at all but asked of
+the sentinels, and it changes when the master does. :class:`DbConfig` carries
+the sentinel list instead of a host, and :func:`connect_async` hands it to
+redis-py, whose pool re-resolves the master on every reconnect. A failover
+therefore arrives in an adapter as a dropped connection -- which
+``Adapter._run_pump`` already reopens and re-subscribes.
 """
 
 from __future__ import annotations
@@ -36,6 +44,8 @@ from typing import Any, Iterable
 
 import redis
 import redis.asyncio as aioredis
+import redis.asyncio.sentinel as aiosentinel
+import redis.sentinel
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="redis")
 
@@ -180,8 +190,10 @@ class DbConfig:
     """
 
     #: Where the database listens. ``127.0.0.1`` for the built-in server in a standard install.
+    #: Empty when :attr:`sentinels` is set: a sentinel setup has no fixed database address.
     host: str
-    #: Port. The built-in servers default to 9000 for states and 9001 for objects.
+    #: Port. The built-in servers default to 9000 for states and 9001 for objects. ``0`` when
+    #: :attr:`sentinels` is set.
     port: int
     #: Redis database number. Always 0 for the built-in servers, which know only one.
     db: int
@@ -191,6 +203,33 @@ class DbConfig:
     #: Which server answers: ``"jsonl"``, ``"file"`` or ``"redis"``. Decides more than it looks
     #: like -- see :attr:`is_builtin`.
     kind: str  # "jsonl", "file" or "redis"
+    #: Sentinels to ask for the master's address, one ``(host, port)`` pair each. Empty in the
+    #: ordinary case; when it is set, :attr:`host` and :attr:`port` are not filled in, because
+    #: the address is whatever the sentinels answer at the moment the connection is made.
+    #:
+    #: A tuple rather than a list so the dataclass stays hashable, like the frozen container it
+    #: is declared as.
+    sentinels: tuple[tuple[str, int], ...] = ()
+    #: Name of the master group the sentinels monitor. js-controller defaults it to ``mymaster``
+    #: when ``sentinelName`` is not configured, and so does this.
+    sentinel_name: str = "mymaster"
+
+    @property
+    def uses_sentinel(self) -> bool:
+        """True when the master has to be discovered rather than connected to directly."""
+        return bool(self.sentinels)
+
+    @property
+    def location(self) -> str:
+        """Where this configuration points, for a log line or a diagnostic.
+
+        Not an address to connect to -- :func:`connect_async` is the only thing that should be
+        turning a configuration into a connection. This is what a human reads.
+        """
+        if self.sentinels:
+            via = ", ".join(f"{host}:{port}" for host, port in self.sentinels)
+            return f"sentinel group {self.sentinel_name!r} via {via}"
+        return f"{self.host}:{self.port}"
 
     @property
     def is_builtin(self) -> bool:
@@ -203,6 +242,64 @@ class DbConfig:
         README's "How the built-in server differs from Redis".
         """
         return self.kind != "redis"
+
+
+#: Port a sentinel listens on unless it says otherwise -- Redis Sentinel's own default.
+_SENTINEL_PORT = 26379
+
+
+def _parse_sentinels(text: str) -> tuple[tuple[str, int], ...]:
+    """Parse a ``host:port,host:port`` list into address pairs.
+
+    The format js-controller writes into ``IOB_<SECTION>_SENTINELS``. An entry without a port
+    falls back to 26379 so a hand-written service file can leave it out, and an IPv6 literal is
+    written in brackets -- ``[::1]:26379`` -- because otherwise its own colons are
+    indistinguishable from the separator.
+
+    :param text: the comma-separated list; blank entries are skipped
+    :returns: one ``(host, port)`` pair per entry, in the order given
+    :raises ValueError: when a port is present but not a number
+    """
+    pairs: list[tuple[str, int]] = []
+
+    for entry in text.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+
+        if entry.startswith("["):  # [::1] or [::1]:26379
+            host, _, rest = entry[1:].partition("]")
+            port = rest.lstrip(":")
+            pairs.append((host, int(port) if port else _SENTINEL_PORT))
+            continue
+
+        host, separator, port = entry.rpartition(":")
+        pairs.append((host, int(port)) if separator else (entry, _SENTINEL_PORT))
+
+    return tuple(pairs)
+
+
+def _sentinels_from_file(part: dict) -> tuple[tuple[str, int], ...]:
+    """Read the sentinel list out of one section of ``iobroker.json``.
+
+    A list of hosts is how ioBroker records a sentinel setup -- there is no separate flag. The
+    ports are either one list matching the hosts index for index, or a single port shared by all
+    of them, which is exactly how js-controller reads the same two fields.
+
+    :param part: the ``states`` or ``objects`` section
+    :returns: the sentinel addresses, empty when this is an ordinary single-host configuration
+    """
+    hosts = part.get("host")
+
+    if not isinstance(hosts, list):
+        return ()
+
+    ports = part.get("port", _SENTINEL_PORT)
+
+    return tuple(
+        (host, int(ports[index] if isinstance(ports, list) else ports))
+        for index, host in enumerate(hosts)
+    )
 
 
 def find_config(explicit: str | None = None) -> str:
@@ -238,9 +335,14 @@ def load_db_config(section: str, path: str | None = None) -> DbConfig:
     """Read the ``states`` or ``objects`` section of ``iobroker.json``.
 
     The py-controller passes these values in environment variables
-    (``IOB_STATES_PORT``, ``IOB_OBJECTS_HOST``, ...); when ``…_PORT`` is set the file is not read
-    at all. That is the normal case for an adapter the controller starts, and the file is the
-    fallback for a script run by hand.
+    (``IOB_STATES_PORT``, ``IOB_OBJECTS_HOST``, ...); when ``…_PORT`` or ``…_SENTINELS`` is set
+    the file is not read at all. That is the normal case for an adapter the controller starts,
+    and the file is the fallback for a script run by hand.
+
+    Either form can describe a Redis Sentinel setup. In the environment that is
+    ``IOB_<SECTION>_SENTINELS`` plus an optional ``…_SENTINEL_NAME``; in the file it is a
+    ``host`` that is a list, which is how ioBroker has always recorded one. The resulting
+    :class:`DbConfig` then carries no host and no port -- see :attr:`DbConfig.sentinels`.
 
     :param section: ``"states"`` or ``"objects"``
     :param path: where to look for ``iobroker.json``; searched for when omitted, and ignored
@@ -252,25 +354,34 @@ def load_db_config(section: str, path: str | None = None) -> DbConfig:
         raise ValueError(f"Unknown section: {section}")
 
     prefix = f"IOB_{section.upper()}_"
-    if os.environ.get(prefix + "PORT"):
+    sentinels = _parse_sentinels(os.environ.get(prefix + "SENTINELS", ""))
+
+    # The sentinel list alone is enough to decide. Testing for a port would send an adapter off
+    # to read iobroker.json instead, because a sentinel configuration has none.
+    if sentinels or os.environ.get(prefix + "PORT"):
         return DbConfig(
-            host=os.environ.get(prefix + "HOST", "127.0.0.1"),
-            port=int(os.environ[prefix + "PORT"]),
+            host="" if sentinels else os.environ.get(prefix + "HOST", "127.0.0.1"),
+            port=0 if sentinels else int(os.environ[prefix + "PORT"]),
             db=int(os.environ.get(prefix + "DB", "0")),
             password=os.environ.get(prefix + "PASS") or None,
             kind=os.environ.get(prefix + "TYPE", "jsonl"),
+            sentinels=sentinels,
+            sentinel_name=os.environ.get(prefix + "SENTINEL_NAME") or "mymaster",
         )
 
     with open(find_config(path), encoding="utf-8") as handle:
         cfg = json.load(handle)
     part = cfg[section]
     opts = part.get("options") or {}
+    sentinels = _sentinels_from_file(part)
     return DbConfig(
-        host=part.get("host", "127.0.0.1"),
-        port=int(part.get("port", 9000 if section == "states" else 9001)),
+        host="" if sentinels else part.get("host", "127.0.0.1"),
+        port=0 if sentinels else int(part.get("port", 9000 if section == "states" else 9001)),
         db=int(opts.get("db") or 0),
         password=opts.get("auth_pass") or None,
         kind=part.get("type", "jsonl"),
+        sentinels=sentinels,
+        sentinel_name=part.get("sentinelName") or "mymaster",
     )
 
 
@@ -300,6 +411,14 @@ def connect(cfg: DbConfig) -> redis.Redis:
 
     :param cfg: which database to connect to
     """
+    if cfg.sentinels:
+        return redis.sentinel.Sentinel(
+            list(cfg.sentinels),
+            db=cfg.db,
+            password=cfg.password,
+            **_POOL_KWARGS,
+        ).master_for(cfg.sentinel_name)
+
     pool = redis.ConnectionPool(
         connection_class=IoBrokerConnection,
         host=cfg.host,
@@ -321,6 +440,24 @@ def connect_async(cfg: DbConfig, decode: bool = True) -> aioredis.Redis:
     """
     kwargs = dict(_POOL_KWARGS)
     kwargs["decode_responses"] = decode
+
+    if cfg.sentinels:
+        # Deliberately *not* AsyncIoBrokerConnection. The pool has to build
+        # ``SentinelManagedConnection``s -- those are what re-resolve the master when it moves,
+        # and substituting the class would quietly turn the failover handling off. Nothing is
+        # lost: the lowercasing that class exists for is needed only by js-controller's built-in
+        # server, and a sentinel setup is real Redis, whose command names are case-insensitive.
+        #
+        # ``password`` reaches the database but not the sentinels, because redis-py forwards only
+        # the ``socket_*`` options to those. That matches js-controller, which hands ioredis a
+        # ``password`` and no ``sentinelPassword``: sentinels with their own authentication are
+        # out of reach on both sides.
+        return aiosentinel.Sentinel(
+            list(cfg.sentinels),
+            db=cfg.db,
+            password=cfg.password,
+            **kwargs,
+        ).master_for(cfg.sentinel_name)
 
     pool = aioredis.ConnectionPool(
         connection_class=AsyncIoBrokerConnection,

@@ -1224,11 +1224,28 @@ one by hand outside a test.
 
 **Fields**
 
-- `host` — Where the database listens. `127.0.0.1` for the built-in server in a standard install.
-- `port` — Port. The built-in servers default to 9000 for states and 9001 for objects.
+- `host` — Where the database listens. `127.0.0.1` for the built-in server in a standard install. Empty when `sentinels` is set: a sentinel setup has no fixed database address.
+- `port` — Port. The built-in servers default to 9000 for states and 9001 for objects. `0` when `sentinels` is set.
 - `db` — Redis database number. Always 0 for the built-in servers, which know only one.
 - `password` — Password, or `None`. The built-in servers are usually unauthenticated and reachable only on the loopback interface.
 - `kind` — Which server answers: `"jsonl"`, `"file"` or `"redis"`. Decides more than it looks like — see `is_builtin()`.
+- `sentinels` — Sentinels to ask for the master's address, one `(host, port)` pair each. Empty in the ordinary case; when it is set, `host` and `port` are not filled in, because the address is whatever the sentinels answer at the moment the connection is made.  A tuple rather than a list so the dataclass stays hashable, like the frozen container it is declared as.
+- `sentinel_name` — Name of the master group the sentinels monitor. js-controller defaults it to `mymaster` when `sentinelName` is not configured, and so does this.
+
+#### `uses_sentinel`
+
+*property*
+
+True when the master has to be discovered rather than connected to directly.
+
+#### `location`
+
+*property*
+
+Where this configuration points, for a log line or a diagnostic.
+
+Not an address to connect to — `connect_async()` is the only thing that should be
+turning a configuration into a connection. This is what a human reads.
 
 #### `is_builtin`
 
@@ -1322,9 +1339,14 @@ load_db_config(section: str, path: str | None = None) -> DbConfig
 Read the `states` or `objects` section of `iobroker.json`.
 
 The py-controller passes these values in environment variables
-(`IOB_STATES_PORT`, `IOB_OBJECTS_HOST`, ...); when `…_PORT` is set the file is not read
-at all. That is the normal case for an adapter the controller starts, and the file is the
-fallback for a script run by hand.
+(`IOB_STATES_PORT`, `IOB_OBJECTS_HOST`, ...); when `…_PORT` or `…_SENTINELS` is set
+the file is not read at all. That is the normal case for an adapter the controller starts,
+and the file is the fallback for a script run by hand.
+
+Either form can describe a Redis Sentinel setup. In the environment that is
+`IOB_<SECTION>_SENTINELS` plus an optional `…_SENTINEL_NAME`; in the file it is a
+`host` that is a list, which is how ioBroker has always recorded one. The resulting
+`DbConfig` then carries no host and no port — see `sentinels`.
 
 **Parameters**
 

@@ -59,6 +59,27 @@ The adapter resolves them in this order:
 2. `IOB_CONFIG` holding the path to `iobroker.json`.
 3. The usual installation paths.
 
+### Redis Sentinel
+
+A redundant installation has no fixed database address: the master is whatever the
+sentinels currently say it is, and that changes on a failover. Either source can
+describe one — `IOB_STATES_SENTINELS=host:port,host:port` with an optional
+`IOB_STATES_SENTINEL_NAME` (default `mymaster`), or a `host` that is a list in
+`iobroker.json`, which is how ioBroker has always recorded a sentinel setup. The
+resulting `DbConfig` then carries `sentinels` instead of a host and port, and
+`connect_async()` builds a client that re-asks the sentinels whenever it reconnects.
+
+What that means for an adapter, measured against a real sentinel rather than assumed:
+a failover arrives as a dropped connection, roughly ten seconds after the promotion —
+the time the sentinels take to demote the old master. The adapter's pumps reopen it and
+replay their subscriptions, the same way they survive any other outage, so nothing has
+to be restarted. During those ten seconds writes still go to the old master and are lost
+when it resyncs; that window is Sentinel's own and every client has it, js-controller
+included.
+
+Sentinels with their own password are not supported, on either side: js-controller
+passes ioredis a `password` and no `sentinelPassword`.
+
 Instance number and log level come from `--instance` / `--loglevel` or from
 `IOB_INSTANCE` / `IOB_LOGLEVEL` — the same arguments js-controller already
 passes to Node adapters today.

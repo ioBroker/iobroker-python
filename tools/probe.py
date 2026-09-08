@@ -83,8 +83,8 @@ def main() -> int:
     objects_cfg = load_db_config("objects", cfg_path)
     states = connect(states_cfg)
     objects = connect(objects_cfg)
-    print(f"States : {states_cfg.kind} @ {states_cfg.host}:{states_cfg.port}")
-    print(f"Objects: {objects_cfg.kind} @ {objects_cfg.host}:{objects_cfg.port}")
+    print(f"States : {states_cfg.kind} @ {states_cfg.location}")
+    print(f"Objects: {objects_cfg.kind} @ {objects_cfg.location}")
 
     obj_id = f"cfg.o.{NS}.temperature"
     state_id = f"io.{NS}.temperature"
